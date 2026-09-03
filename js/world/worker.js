@@ -15,7 +15,17 @@ MC.WorkerSource = function workerMain(ns) {
   var pumping = false;
   var STATS = { genMs: 0, genN: 0, meshMs: 0, meshN: 0, lightMs: 0 };
   var lightOpacity = new Uint8Array(BLOCKS.length), emission = new Uint8Array(BLOCKS.length), opaque = new Uint8Array(BLOCKS.length);
-  for (var i = 0; i < BLOCKS.length; i++) { lightOpacity[i] = BLOCKS[i].lightOpacity; emission[i] = BLOCKS[i].light; opaque[i] = BLOCKS[i].opaque ? 1 : 0; }
+  // Per-block-id flags, resolved once. The mesher used to run regexes and name comparisons
+  // per face per block, which is millions of string operations per chunk.
+  var isLeaves = new Uint8Array(BLOCKS.length), isLog = new Uint8Array(BLOCKS.length), isDirectional = new Uint8Array(BLOCKS.length);
+  var DIRECTIONAL_NAMES = { furnace: 1, crafting_table: 1, jack_o_lantern: 1, carved_pumpkin: 1, chest: 1 };
+  for (var i = 0; i < BLOCKS.length; i++) {
+    var B0 = BLOCKS[i];
+    lightOpacity[i] = B0.lightOpacity; emission[i] = B0.light; opaque[i] = B0.opaque ? 1 : 0;
+    isLeaves[i] = (/leaves/).test(B0.name) ? 1 : 0;
+    isLog[i] = (/_log$/).test(B0.name) ? 1 : 0;
+    isDirectional[i] = DIRECTIONAL_NAMES[B0.name] ? 1 : 0;
+  }
   var ID = {}; for (var k in BLOCK) ID[k] = BLOCK[k].id;
 
   function key(cx, cz) { return (cx + 32768) * 65536 + (cz + 32768); }
@@ -87,7 +97,7 @@ MC.WorkerSource = function workerMain(ns) {
       else if (t > 0.6 && hu < 0.3 && jit > 0.3) b = BIOME.savanna;
       else b = BIOME.plains;
       if (forceBiome && BIOME[forceBiome] && hi >= SEA - 1) { b = BIOME[forceBiome]; if (hi < SEA + 2) { hi = SEA + 2 + Math.floor(hills * 2 + 2); h = hi; } }
-      var i = lx * 16 + lz; heights[i] = hi; biomes[i] = b.id; mount[i] = m;
+      var ii = lx * 16 + lz; heights[ii] = hi; biomes[ii] = b.id; mount[ii] = m;
     }
     cc = { heights: heights, biomes: biomes, mount: mount }; colCache.set(kk, cc); return cc;
   }
@@ -102,57 +112,68 @@ MC.WorkerSource = function workerMain(ns) {
     return false;
   }
 
+  // Trilinear lookup into the 5x33x5 cave grid. The helper closure this used to declare was
+  // being allocated once per solid voxel.
+  function caveInterp(cg, lx, y, lz) {
+    var gx = lx >> 2, gz = lz >> 2, gy = y >> 2;
+    var fx = (lx & 3) / 4, fz = (lz & 3) / 4, fy = (y & 3) / 4;
+    var b00 = (gx * 5 + gz) * 33 + gy, b10 = ((gx + 1) * 5 + gz) * 33 + gy, b01 = (gx * 5 + gz + 1) * 33 + gy, b11 = ((gx + 1) * 5 + gz + 1) * 33 + gy;
+    var v = (cg[b00] * (1 - fx) + cg[b10] * fx) * (1 - fz) * (1 - fy)
+      + (cg[b01] * (1 - fx) + cg[b11] * fx) * fz * (1 - fy)
+      + (cg[b00 + 1] * (1 - fx) + cg[b10 + 1] * fx) * (1 - fz) * fy
+      + (cg[b01 + 1] * (1 - fx) + cg[b11 + 1] * fx) * fz * fy;
+    return v > 0.5;
+  }
+
+  var caveGrid = new Uint8Array(5 * 33 * 5);
   function generate(cx, cz) {
     var c = { cx: cx, cz: cz, blocks: new Uint8Array(16 * 16 * H), meta: new Uint8Array(16 * 16 * H), light: new Uint8Array(16 * 16 * H), heights: new Uint8Array(256), biomes: new Uint8Array(256), topSolid: new Uint8Array(256), generated: false, lit: false, meshed: false, dirty: false, maxH: 0 };
     var cc = columns(cx, cz); c.heights.set(cc.heights); c.biomes.set(cc.biomes);
     var bl = c.blocks; var R = chunkRng(cx, cz, 1);
     var ST = ID.stone, DS = ID.deepslate, DIRT = ID.dirt, GRASS = ID.grass_block, SAND = ID.sand, SANDST = ID.sandstone, GRAVEL = ID.gravel, WATER = ID.water, BED = ID.bedrock, SNOWG = ID.snowy_grass_block, SNOWB = ID.snow_block, ICE = ID.ice, CLAY = ID.clay, RSAND = ID.red_sand;
-    // cave grid (5x33x5, step 4)
-    var cg = new Uint8Array(5 * 33 * 5);
+    // cave grid (5x33x5, step 4), reused between chunks
+    var cg = caveGrid;
     for (var gx = 0; gx <= 4; gx++) for (var gz = 0; gz <= 4; gz++) for (var gy = 0; gy <= 32; gy++) cg[(gx * 5 + gz) * 33 + gy] = caveAt(cx * 16 + gx * 4, gy * 4, cz * 16 + gz * 4) ? 1 : 0;
-    function caveInterp(lx, y, lz) {
-      var gx = lx >> 2, gz = lz >> 2, gy = y >> 2; var fx = (lx & 3) / 4, fz = (lz & 3) / 4, fy = (y & 3) / 4;
-      function g(a, b, d) { return cg[((gx + a) * 5 + (gz + b)) * 33 + gy + d]; }
-      var v = (g(0, 0, 0) * (1 - fx) + g(1, 0, 0) * fx) * (1 - fz) * (1 - fy) + (g(0, 1, 0) * (1 - fx) + g(1, 1, 0) * fx) * fz * (1 - fy) + (g(0, 0, 1) * (1 - fx) + g(1, 0, 1) * fx) * (1 - fz) * fy + (g(0, 1, 1) * (1 - fx) + g(1, 1, 1) * fx) * fz * fy;
-      return v > 0.5;
-    }
-    for (var lx = 0; lx < 16; lx++) for (var lz = 0; lz < 16; lz++) {
-      var x = cx * 16 + lx, z = cz * 16 + lz; var ci = lx * 16 + lz;
-      var h = cc.heights[ci], b = ns.BIOMES[cc.biomes[ci]], m = cc.mount[ci];
+    var lx, lz, ci, y, b;
+    for (lx = 0; lx < 16; lx++) for (lz = 0; lz < 16; lz++) {
+      var x = cx * 16 + lx, z = cz * 16 + lz; ci = lx * 16 + lz;
+      var h = cc.heights[ci]; b = ns.BIOMES[cc.biomes[ci]]; var m = cc.mount[ci];
       // slope from neighbouring heights
       var slope = Math.max(Math.abs(heightAt(x + 1, z) - h), Math.abs(heightAt(x - 1, z) - h), Math.abs(heightAt(x, z + 1) - h), Math.abs(heightAt(x, z - 1) - h));
       var patch = N.patch.noise2D(x / 18, z / 18);
       var base = ci << 7;
-      var topSolid = 0;
-      for (var y = 0; y < H; y++) {
+      var bn = b.name;
+      for (y = 0; y < H; y++) {
         var id = AIR;
         if (y === 0 || (y < 5 && R() < (5 - y) / 5)) id = BED;
         else if (y <= h) {
           var depth = h - y;
           id = y < 10 + R() * 3 ? DS : ST;
-          var bn = b.name;
-          if (bn === 'ocean' || bn === 'river') { if (depth < 3) id = patch > 0.35 ? GRAVEL : (patch < -0.45 ? CLAY : SAND); else if (depth < 5) id = SAND; }
-          else if (bn === 'beach') { if (depth < 4) id = SAND; else if (depth < 7) id = SANDST; }
-          else if (bn === 'desert') { if (depth < 4) id = patch > 0.55 ? RSAND : SAND; else if (depth < 8) id = SANDST; }
-          else if (bn === 'snowy_plains') { if (depth === 0) id = SNOWG; else if (depth < 4) id = DIRT; }
-          else if (bn === 'snowy_slopes') { if (depth === 0) id = (y > 96 || slope < 3) ? (y > 100 ? SNOWB : SNOWG) : ST; else if (depth < 3 && slope < 3) id = y > 100 ? SNOWB : DIRT; }
-          else if (bn === 'windswept_hills' || bn === 'meadow' || bn === 'cherry_grove') {
-            var exposed = slope >= 3 || y > 96 + patch * 6 + (bn === 'windswept_hills' ? 0 : 16);
-            if (exposed) { if (depth < 2 && patch > 0.5) id = GRAVEL; }
-            else if (depth === 0) id = GRASS; else if (depth < 3 + (patch > 0 ? 1 : 0)) id = DIRT;
+          // Every branch below requires depth < 8, so skip the whole name ladder for the
+          // ~60 deep voxels in a typical column. (No RNG is consumed in here, so terrain
+          // output is unchanged.)
+          if (depth < 8) {
+            if (bn === 'ocean' || bn === 'river') { if (depth < 3) id = patch > 0.35 ? GRAVEL : (patch < -0.45 ? CLAY : SAND); else if (depth < 5) id = SAND; }
+            else if (bn === 'beach') { if (depth < 4) id = SAND; else if (depth < 7) id = SANDST; }
+            else if (bn === 'desert') { if (depth < 4) id = patch > 0.55 ? RSAND : SAND; else if (depth < 8) id = SANDST; }
+            else if (bn === 'snowy_plains') { if (depth === 0) id = SNOWG; else if (depth < 4) id = DIRT; }
+            else if (bn === 'snowy_slopes') { if (depth === 0) id = (y > 96 || slope < 3) ? (y > 100 ? SNOWB : SNOWG) : ST; else if (depth < 3 && slope < 3) id = y > 100 ? SNOWB : DIRT; }
+            else if (bn === 'windswept_hills' || bn === 'meadow' || bn === 'cherry_grove') {
+              var exposed = slope >= 3 || y > 96 + patch * 6 + (bn === 'windswept_hills' ? 0 : 16);
+              if (exposed) { if (depth < 2 && patch > 0.5) id = GRAVEL; }
+              else if (depth === 0) id = GRASS; else if (depth < 3 + (patch > 0 ? 1 : 0)) id = DIRT;
+            }
+            else if (bn === 'swamp') { if (depth === 0) id = h <= SEA ? DIRT : GRASS; else if (depth < 3) id = patch > 0.3 ? CLAY : DIRT; }
+            else if (bn === 'jungle' || bn === 'taiga') { if (depth === 0) id = GRASS; else if (depth < 4) id = (bn === 'taiga' && patch > 0.5 && depth === 1) ? ID.coarse_dirt : DIRT; if (bn === 'taiga' && depth === 0 && patch > 0.6) id = ID.podzol; }
+            else { if (depth === 0) id = GRASS; else if (depth < 3 + (patch > 0.2 ? 1 : 0)) id = DIRT; if (bn === 'savanna' && depth === 0 && patch > 0.7) id = ID.coarse_dirt; }
           }
-          else if (bn === 'swamp') { if (depth === 0) id = h <= SEA ? DIRT : GRASS; else if (depth < 3) id = patch > 0.3 ? CLAY : DIRT; }
-          else if (bn === 'jungle' || bn === 'taiga') { if (depth === 0) id = GRASS; else if (depth < 4) id = (bn === 'taiga' && patch > 0.5 && depth === 1) ? ID.coarse_dirt : DIRT; if (bn === 'taiga' && depth === 0 && patch > 0.6) id = ID.podzol; }
-          else { if (depth === 0) id = GRASS; else if (depth < 3 + (patch > 0.2 ? 1 : 0)) id = DIRT; if (bn === 'savanna' && depth === 0 && patch > 0.7) id = ID.coarse_dirt; }
           // caves
-          if (y >= 2 && id !== BED && !(h <= SEA + 1 && y > h - 4) && caveInterp(lx, y, lz)) { id = y < 11 ? ID.lava : AIR; }
+          if (y >= 2 && id !== BED && !(h <= SEA + 1 && y > h - 4) && caveInterp(cg, lx, y, lz)) id = y < 11 ? ID.lava : AIR;
           else if (y === h && slope >= 4 && id === GRASS && m > 0.4) id = ST;
         }
-        else if (y <= SEA) { id = WATER; if (y === SEA && (b.name === 'snowy_plains' || b.name === 'snowy_slopes' || b.name === 'taiga' && R() < 0.5)) id = ICE; }
+        else if (y <= SEA) { id = WATER; if (y === SEA && (bn === 'snowy_plains' || bn === 'snowy_slopes' || (bn === 'taiga' && R() < 0.5))) id = ICE; }
         bl[base + y] = id;
-        if (id !== AIR && id !== WATER && id !== ID.lava && !(id === ICE)) topSolid = y;
       }
-      c.topSolid[ci] = topSolid;
     }
     placeOres(c, R);
     decorate(c);
@@ -163,9 +184,20 @@ MC.WorkerSource = function workerMain(ns) {
         for (y = H - 2; y > SEA; y--) { var bid = bl[(ci << 7) + y]; if (bid !== AIR) { if (BLOCKS[bid].solid && bl[(ci << 7) + y + 1] === AIR && bid !== ICE) bl[(ci << 7) + y + 1] = ID.snow; break; } }
       }
     }
-    // compute maxH (highest non-air)
+    // maxH (highest non-air) + topSolid, in one descending pass per column.
+    // The old code tracked topSolid inside the main voxel loop and then threw that away and
+    // recomputed it here, in a second set of loops.
     var maxH = 0;
-    for (ci = 0; ci < 256; ci++) { for (y = H - 1; y >= 0; y--) if (bl[(ci << 7) + y] !== AIR) { if (y > maxH) maxH = y; break; } var ts = 0; for (y = H - 1; y >= 0; y--) { var q = bl[(ci << 7) + y]; if (BLOCKS[q].solid) { ts = y; break; } } c.topSolid[ci] = ts; }
+    for (ci = 0; ci < 256; ci++) {
+      var cbase = ci << 7, top = -1, ts = 0;
+      for (y = H - 1; y >= 0; y--) {
+        var q = bl[cbase + y];
+        if (q === AIR) continue;
+        if (top < 0) { top = y; if (y > maxH) maxH = y; }
+        if (BLOCKS[q].solid) { ts = y; break; }
+      }
+      c.topSolid[ci] = ts;
+    }
     c.maxH = maxH;
     c.generated = true;
     return c;
@@ -192,12 +224,15 @@ MC.WorkerSource = function workerMain(ns) {
   }
 
   // ---------------- decorations (trees, plants) ----------------
+  // Hoisted: these were object literals rebuilt inside loops (tree counts 9x per chunk,
+  // grass density 256x per chunk).
+  var TREE_COUNTS = { forest: 7, birch_forest: 7, taiga: 6, jungle: 9, cherry_grove: 3, savanna: 1, swamp: 2, plains: 0, meadow: 0, windswept_hills: 0, snowy_plains: 0, snowy_slopes: 0, desert: 0, ocean: 0, river: 0, beach: 0 };
+  var GRASS_DENSITY = { plains: 0.22, meadow: 0.5, forest: 0.12, birch_forest: 0.12, savanna: 0.5, jungle: 0.35, swamp: 0.25, taiga: 0.08, windswept_hills: 0.1, cherry_grove: 0.08 };
+  var TREE_SOIL = {};
   function treeList(cx, cz) {
     var R = chunkRng(cx, cz, 2); var cc = columns(cx, cz); var list = [];
-    // count trees per biome (sample biome at chunk center)
-    var counts = { forest: 7, birch_forest: 7, taiga: 6, jungle: 9, cherry_grove: 3, savanna: 1, swamp: 2, plains: 0, meadow: 0, windswept_hills: 0, snowy_plains: 0, snowy_slopes: 0, desert: 0, ocean: 0, river: 0, beach: 0 };
     var bC = ns.BIOMES[cc.biomes[8 * 16 + 8]].name;
-    var n = counts[bC] || 0;
+    var n = TREE_COUNTS[bC] || 0;
     if (bC === 'plains' && R() < 0.12) n = 1; if (bC === 'meadow' && R() < 0.25) n = 1; if (bC === 'windswept_hills' && R() < 0.3) n = 1; if (bC === 'snowy_plains' && R() < 0.2) n = 1; if (bC === 'snowy_slopes' && R() < 0.15) n = 1;
     n += Math.floor(R() * 3) - 1; if (n < 0) n = 0;
     for (var i = 0; i < n; i++) {
@@ -287,14 +322,20 @@ MC.WorkerSource = function workerMain(ns) {
         break;
     }
   }
+  var MEADOW_FLOWERS = null, FOREST_FLOWERS = null;
   function decorate(c) {
     var w = makeWriter(c); var cx = c.cx, cz = c.cz;
+    if (!MEADOW_FLOWERS) {
+      MEADOW_FLOWERS = [ID.dandelion, ID.poppy, ID.azure_bluet, ID.cornflower, ID.oxeye_daisy, ID.allium];
+      FOREST_FLOWERS = [ID.dandelion, ID.poppy, ID.lily_of_the_valley, ID.red_tulip, ID.pink_tulip, ID.white_tulip, ID.orange_tulip];
+      TREE_SOIL[ID.grass_block] = 1; TREE_SOIL[ID.dirt] = 1; TREE_SOIL[ID.snowy_grass_block] = 1; TREE_SOIL[ID.podzol] = 1; TREE_SOIL[ID.coarse_dirt] = 1;
+    }
     // trees from 3x3 neighborhood (deterministic), clipped
     for (var dx = -1; dx <= 1; dx++) for (var dz = -1; dz <= 1; dz++) {
       var list = treeList(cx + dx, cz + dz);
       for (var i = 0; i < list.length; i++) {
         var t = list[i];
-        if (dx === 0 && dz === 0) { var below = w.get(t.x, t.y - 1, t.z); if (below !== ID.grass_block && below !== ID.dirt && below !== ID.snowy_grass_block && below !== ID.podzol && below !== ID.coarse_dirt) continue; if (w.get(t.x, t.y, t.z) !== AIR) continue; }
+        if (dx === 0 && dz === 0) { if (!TREE_SOIL[w.get(t.x, t.y - 1, t.z)]) continue; if (w.get(t.x, t.y, t.z) !== AIR) continue; }
         else { if (caveAt(t.x, t.y - 1, t.z) || caveAt(t.x, t.y, t.z)) continue; }
         growTree(w, t);
       }
@@ -304,33 +345,37 @@ MC.WorkerSource = function workerMain(ns) {
     for (var lx = 0; lx < 16; lx++) for (var lz = 0; lz < 16; lz++) {
       var ci = lx * 16 + lz; var b = ns.BIOMES[c.biomes[ci]].name; var h = c.heights[ci];
       var x = cx * 16 + lx, z = cz * 16 + lz;
-      var top = c.blocks[(ci << 7) + h], above = c.blocks[(ci << 7) + h + 1];
+      var cbase = ci << 7;
+      var top = c.blocks[cbase + h], above = c.blocks[cbase + h + 1];
       if (above !== AIR) {
-        if (top === ID.sand || top === ID.gravel || top === ID.clay) { if (above === ID.water && h < SEA - 1 && R() < 0.1) c.blocks[(ci << 7) + h + 1] = ID.seagrass; }
+        if (top === ID.sand || top === ID.gravel || top === ID.clay) { if (above === ID.water && h < SEA - 1 && R() < 0.1) c.blocks[cbase + h + 1] = ID.seagrass; }
         continue;
       }
       var r = R();
       if (top === ID.grass_block) {
-        var grassD = { plains: 0.22, meadow: 0.5, forest: 0.12, birch_forest: 0.12, savanna: 0.5, jungle: 0.35, swamp: 0.25, taiga: 0.08, windswept_hills: 0.1, cherry_grove: 0.08 }[b] || 0.08;
-        if (r < grassD) c.blocks[(ci << 7) + h + 1] = (b === 'taiga' || b === 'jungle') && r < grassD * 0.5 ? ID.fern : ID.short_grass;
+        var grassD = GRASS_DENSITY[b] || 0.08;
+        if (r < grassD) c.blocks[cbase + h + 1] = (b === 'taiga' || b === 'jungle') && r < grassD * 0.5 ? ID.fern : ID.short_grass;
         else if (r < grassD + 0.03) {
           var fl;
-          if (b === 'meadow') fl = [ID.dandelion, ID.poppy, ID.azure_bluet, ID.cornflower, ID.oxeye_daisy, ID.allium][Math.floor(R() * 6)];
-          else if (b === 'forest' || b === 'birch_forest') fl = [ID.dandelion, ID.poppy, ID.lily_of_the_valley, ID.red_tulip, ID.pink_tulip, ID.white_tulip, ID.orange_tulip][Math.floor(R() * 7)];
+          if (b === 'meadow') fl = MEADOW_FLOWERS[Math.floor(R() * 6)];
+          else if (b === 'forest' || b === 'birch_forest') fl = FOREST_FLOWERS[Math.floor(R() * 7)];
           else if (b === 'swamp') fl = ID.blue_orchid;
           else if (b === 'cherry_grove') fl = R() < 0.5 ? ID.pink_petals : ID.dandelion;
           else fl = R() < 0.5 ? ID.dandelion : ID.poppy;
-          c.blocks[(ci << 7) + h + 1] = fl;
+          c.blocks[cbase + h + 1] = fl;
         }
-        else if (b === 'cherry_grove' && r < grassD + 0.25) c.blocks[(ci << 7) + h + 1] = ID.pink_petals;
-        else if ((b === 'plains' || b === 'forest') && r > 0.9985) c.blocks[(ci << 7) + h + 1] = ID.pumpkin;
-        else if ((b === 'swamp' || b === 'taiga') && r > 0.995) c.blocks[(ci << 7) + h + 1] = R() < 0.5 ? ID.brown_mushroom : ID.red_mushroom;
-        else if (b === 'plains' && r > 0.998 && h > SEA) { /* melon */ }
+        else if (b === 'cherry_grove' && r < grassD + 0.25) c.blocks[cbase + h + 1] = ID.pink_petals;
+        else if ((b === 'plains' || b === 'forest') && r > 0.9985) c.blocks[cbase + h + 1] = ID.pumpkin;
+        else if ((b === 'swamp' || b === 'taiga') && r > 0.995) c.blocks[cbase + h + 1] = R() < 0.5 ? ID.brown_mushroom : ID.red_mushroom;
       } else if (top === ID.sand || top === ID.red_sand) {
-        if (b === 'desert') { if (r < 0.012) { var ch = 1 + Math.floor(R() * 3); for (var k = 0; k < ch; k++) if (h + 1 + k < H) c.blocks[(ci << 7) + h + 1 + k] = ID.cactus; } else if (r < 0.03) c.blocks[(ci << 7) + h + 1] = ID.dead_bush; }
-        else if (h === SEA && r < 0.08) { var nearWater = false; for (var ddx = -1; ddx <= 1; ddx++) for (var ddz = -1; ddz <= 1; ddz++) if (heightAt(x + ddx, z + ddz) < SEA) nearWater = true; if (nearWater) { var sh = 1 + Math.floor(R() * 3); for (k = 0; k < sh; k++) c.blocks[(ci << 7) + h + 1 + k] = ID.sugar_cane; } }
-      } else if (top === ID.snowy_grass_block && r < 0.05 && b === 'snowy_plains') { /* sparse */ }
-      else if (top === ID.stone && b === 'windswept_hills' && r < 0.02) c.blocks[(ci << 7) + h + 1] = ID.short_grass;
+        if (b === 'desert') { if (r < 0.012) { var ch = 1 + Math.floor(R() * 3); for (var k = 0; k < ch; k++) if (h + 1 + k < H) c.blocks[cbase + h + 1 + k] = ID.cactus; } else if (r < 0.03) c.blocks[cbase + h + 1] = ID.dead_bush; }
+        else if (h === SEA && r < 0.08) {
+          var nearWater = false;
+          for (var ddx = -1; ddx <= 1; ddx++) for (var ddz = -1; ddz <= 1; ddz++) if (heightAt(x + ddx, z + ddz) < SEA) nearWater = true;
+          if (nearWater) { var sh = 1 + Math.floor(R() * 3); for (k = 0; k < sh; k++) c.blocks[cbase + h + 1 + k] = ID.sugar_cane; }
+        }
+      }
+      else if (top === ID.stone && b === 'windswept_hills' && r < 0.02) c.blocks[cbase + h + 1] = ID.short_grass;
     }
   }
 
@@ -339,7 +384,13 @@ MC.WorkerSource = function workerMain(ns) {
   var qx = new Int32Array(QCAP), qy = new Int32Array(QCAP), qz = new Int32Array(QCAP), ql = new Int32Array(QCAP);
   var qh = 0, qt = 0;
   var rqx = new Int32Array(QCAP), rqy = new Int32Array(QCAP), rqz = new Int32Array(QCAP); var rqt = 0;
-  function qpush(x, y, z, l) { if (qt >= QCAP) { qt = 0; } qx[qt] = x; qy[qt] = y; qz[qt] = z; ql[qt] = l; qt++; }
+  var warnedOverflow = false;
+  // Dropping a push degrades one cell of lighting. The old code reset qt to 0 mid-traversal,
+  // which corrupts the queue and can loop or lose an arbitrary amount of work.
+  function qpush(x, y, z, l) {
+    if (qt >= QCAP) { if (!warnedOverflow) { warnedOverflow = true; console.warn('light queue overflow'); } return; }
+    qx[qt] = x; qy[qt] = y; qz[qt] = z; ql[qt] = l; qt++;
+  }
   function rqpush(x, y, z) { if (rqt >= QCAP) return; rqx[rqt] = x; rqy[rqt] = y; rqz[rqt] = z; rqt++; }
   var DIRS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
 
@@ -474,24 +525,44 @@ MC.WorkerSource = function workerMain(ns) {
   }
 
   // ---------------- meshing ----------------
-  function Builder() { this.pos = []; this.uv = []; this.data = []; this.col = []; this.idx = []; this.n = 0; }
+  // Vertices are written straight into growable typed arrays. This used to be four plain JS
+  // arrays fed by .push() (52 numbers per quad) and then copied wholesale into Float32Arrays.
+  // The builders are module-level and reused, so the buffers settle at the high-water mark.
+  function Builder() { this.cap = 0; this.n = 0; this.ni = 0; this.ensure(8192); }
+  Builder.prototype.ensure = function (cap) {
+    if (cap <= this.cap) return;
+    var pos = new Float32Array(cap * 3), uv = new Float32Array(cap * 2), data = new Float32Array(cap * 4), col = new Float32Array(cap * 4), ix = new Uint32Array(cap * 3 >> 1);
+    if (this.cap) { pos.set(this.pos); uv.set(this.uv); data.set(this.data); col.set(this.col); ix.set(this.idx); }
+    this.pos = pos; this.uv = uv; this.data = data; this.col = col; this.idx = ix; this.cap = cap;
+  };
+  Builder.prototype.reset = function () { this.n = 0; this.ni = 0; };
   Builder.prototype.quad = function (v, uv, layer, overlay, fr, lights, tint, shade, ao) {
     // v: 4 corners [x,y,z], uv: 4 [u,v], lights: 4 [sky, block], ao: 4 factors
-    var base = this.n;
+    if (this.n + 4 > this.cap) this.ensure(this.cap * 2);
+    var n = this.n, P = this.pos, U = this.uv, D = this.data, C = this.col;
+    var p = n * 3, q = n * 2, r = n * 4;
+    var t0 = tint[0], t1 = tint[1], t2 = tint[2];
     for (var i = 0; i < 4; i++) {
-      this.pos.push(v[i][0], v[i][1], v[i][2]); this.uv.push(uv[i][0], uv[i][1]);
-      this.data.push(layer, overlay, fr, lights[i][0] * 16 + lights[i][1]);
-      this.col.push(tint[0], tint[1], tint[2], shade * ao[i]);
+      var vi = v[i], ui = uv[i], li = lights[i];
+      P[p] = vi[0]; P[p + 1] = vi[1]; P[p + 2] = vi[2]; p += 3;
+      U[q] = ui[0]; U[q + 1] = ui[1]; q += 2;
+      D[r] = layer; D[r + 1] = overlay; D[r + 2] = fr; D[r + 3] = li[0] * 16 + li[1];
+      C[r] = t0; C[r + 1] = t1; C[r + 2] = t2; C[r + 3] = shade * ao[i];
+      r += 4;
     }
     // flip quad diagonal for better AO interpolation
-    if (ao[0] + ao[2] > ao[1] + ao[3]) this.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
-    else this.idx.push(base + 1, base + 2, base + 3, base + 1, base + 3, base);
-    this.n += 4;
+    var I = this.idx, j = this.ni;
+    if (ao[0] + ao[2] > ao[1] + ao[3]) { I[j] = n; I[j + 1] = n + 1; I[j + 2] = n + 2; I[j + 3] = n; I[j + 4] = n + 2; I[j + 5] = n + 3; }
+    else { I[j] = n + 1; I[j + 1] = n + 2; I[j + 2] = n + 3; I[j + 3] = n + 1; I[j + 4] = n + 3; I[j + 5] = n; }
+    this.ni = j + 6; this.n = n + 4;
   };
   Builder.prototype.pack = function () {
     if (!this.n) return null;
-    return { pos: new Float32Array(this.pos), uv: new Float32Array(this.uv), data: new Float32Array(this.data), col: new Float32Array(this.col), idx: new Uint32Array(this.idx), count: this.idx.length };
+    // slice() copies, which is required anyway because these buffers get transferred
+    return { pos: this.pos.slice(0, this.n * 3), uv: this.uv.slice(0, this.n * 2), data: this.data.slice(0, this.n * 4), col: this.col.slice(0, this.n * 4), idx: this.idx.slice(0, this.ni), count: this.ni };
   };
+  var opaqueB = new Builder(), cutoutB = new Builder(), waterB = new Builder();
+
   // Face table: normal, corners (unit cube), uv per corner, tangent axes for AO
   var FACE = [
     { n: [1, 0, 0], c: [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]], uv: [[0, 1], [1, 1], [1, 0], [0, 0]], shade: 0.6, t1: 1, t2: 2 },
@@ -503,39 +574,56 @@ MC.WorkerSource = function workerMain(ns) {
   ];
   var WHITE = [1, 1, 1];
   var AO_OCC = 0.2;
-
+  var _tint = [1, 1, 1];
+  // Writes into a scratch triple rather than allocating one per block.
   function tintColorFor(kind, tints, ci) {
     if (!kind) return WHITE;
     var t = kind === 'grass' ? tints.grass : kind === 'foliage' ? tints.foliage : kind === 'water' ? tints.water : null;
-    if (t) return [t[ci * 3] / 255, t[ci * 3 + 1] / 255, t[ci * 3 + 2] / 255];
-    var st = ns.STATIC_TINT[kind]; if (st) return [st[0] / 255, st[1] / 255, st[2] / 255];
+    if (t) { var o = ci * 3; _tint[0] = t[o] / 255; _tint[1] = t[o + 1] / 255; _tint[2] = t[o + 2] / 255; return _tint; }
+    var st = ns.STATIC_TINT[kind];
+    if (st) { _tint[0] = st[0] / 255; _tint[1] = st[1] / 255; _tint[2] = st[2] / 255; return _tint; }
     return WHITE;
   }
-  function biomeTints(c) {
-    // blended biome colors per column (5x5 neighborhood)
-    var grass = new Float32Array(256 * 3), foliage = new Float32Array(256 * 3), water = new Float32Array(256 * 3);
-    for (var lx = 0; lx < 16; lx++) for (var lz = 0; lz < 16; lz++) {
+  var tintGrass = new Float32Array(256 * 3), tintFoliage = new Float32Array(256 * 3), tintWater = new Float32Array(256 * 3);
+  var tintsOut = { grass: tintGrass, foliage: tintFoliage, water: tintWater };
+  // Blended biome colors per column (5x5 neighborhood). Reads the caller's 3x3 chunk array
+  // instead of doing a hashed Map lookup for each of the 6400 samples.
+  function biomeTints(c, NBH) {
+    var ccx = c.cx, ccz = c.cz;
+    for (var lx = 0; lx < 16; lx++) for (lz2 = 0; lz2 < 16; lz2++) {
+      var lz = lz2;
       var gr = 0, gg = 0, gb = 0, fr = 0, fg = 0, fb = 0, wr = 0, wg = 0, wb = 0, n = 0;
+      var fallback = c.biomes[lx * 16 + lz];
       for (var dx = -2; dx <= 2; dx++) for (var dz = -2; dz <= 2; dz++) {
-        var x = c.cx * 16 + lx + dx, z = c.cz * 16 + lz + dz; var nc = chunks.get(key(x >> 4, z >> 4));
-        var bid = (nc && nc.generated) ? nc.biomes[(x & 15) * 16 + (z & 15)] : c.biomes[lx * 16 + lz];
-        var b = ns.BIOMES[bid]; gr += b.grass[0]; gg += b.grass[1]; gb += b.grass[2]; fr += b.foliage[0]; fg += b.foliage[1]; fb += b.foliage[2]; wr += b.water[0]; wg += b.water[1]; wb += b.water[2]; n++;
+        var x = ccx * 16 + lx + dx, z = ccz * 16 + lz + dz;
+        var ncx = (x >> 4) - ccx + 1, ncz = (z >> 4) - ccz + 1;
+        var nc = (ncx >= 0 && ncx <= 2 && ncz >= 0 && ncz <= 2) ? NBH[ncx * 3 + ncz] : null;
+        var bid = nc ? nc.biomes[(x & 15) * 16 + (z & 15)] : fallback;
+        var b = ns.BIOMES[bid];
+        gr += b.grass[0]; gg += b.grass[1]; gb += b.grass[2];
+        fr += b.foliage[0]; fg += b.foliage[1]; fb += b.foliage[2];
+        wr += b.water[0]; wg += b.water[1]; wb += b.water[2];
+        n++;
       }
-      var ci = (lx * 16 + lz) * 3; grass[ci] = gr / n; grass[ci + 1] = gg / n; grass[ci + 2] = gb / n; foliage[ci] = fr / n; foliage[ci + 1] = fg / n; foliage[ci + 2] = fb / n; water[ci] = wr / n; water[ci + 1] = wg / n; water[ci + 2] = wb / n;
+      var ci = (lx * 16 + lz) * 3;
+      tintGrass[ci] = gr / n; tintGrass[ci + 1] = gg / n; tintGrass[ci + 2] = gb / n;
+      tintFoliage[ci] = fr / n; tintFoliage[ci + 1] = fg / n; tintFoliage[ci + 2] = fb / n;
+      tintWater[ci] = wr / n; tintWater[ci + 1] = wg / n; tintWater[ci + 2] = wb / n;
     }
-    return { grass: grass, foliage: foliage, water: water };
+    var lz2;
+    return tintsOut;
   }
 
   function meshChunk(c) {
     var ox = c.cx * 16, oz = c.cz * 16;
-    var opaqueB = new Builder(), cutoutB = new Builder(), waterB = new Builder();
-    var tints = biomeTints(c);
+    opaqueB.reset(); cutoutB.reset(); waterB.reset();
     var bl = c.blocks;
     // neighborhood-cached getters (no string keys / map lookups in the hot path)
     var NBH = neighborhood(c); var bedId = ID.bedrock; var ccx = c.cx, ccz = c.cz;
+    var tints = biomeTints(c, NBH);
     function gb(x, y, z) { if (y < 0) return bedId; if (y >= H) return AIR; var dx = (x >> 4) - ccx + 1, dz = (z >> 4) - ccz + 1; if (dx < 0 || dx > 2 || dz < 0 || dz > 2) return AIR; var nc = NBH[dx * 3 + dz]; if (!nc) return AIR; return nc.blocks[(((x & 15) << 4 | (z & 15)) << 7) | y]; }
     function gl(x, y, z) { if (y >= H) return 0xF0; if (y < 0) return 0; var dx = (x >> 4) - ccx + 1, dz = (z >> 4) - ccz + 1; if (dx < 0 || dx > 2 || dz < 0 || dz > 2) return 0xF0; var nc = NBH[dx * 3 + dz]; if (!nc) return 0xF0; return nc.light[(((x & 15) << 4 | (z & 15)) << 7) | y]; }
-    function vertexLightAO(x, y, z, f, ci, out) {
+    function vertexLightAO(x, y, z, f, out) {
       var n = f.n; var nx = x + n[0], ny = y + n[1], nz = z + n[2];
       var cl = gl(nx, ny, nz); var csky = cl >> 4, cblk = cl & 15;
       var a1 = f.t1, a2 = f.t2;
@@ -560,35 +648,63 @@ MC.WorkerSource = function workerMain(ns) {
     var v = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
     function cubeFace(x, y, z, f, layer, overlay, fr, tint, builder, x0, y0, z0, x1, y1, z1, uvs) {
       for (var k = 0; k < 4; k++) { var cc = f.c[k]; v[k][0] = x + (cc[0] ? x1 : x0); v[k][1] = y + (cc[1] ? y1 : y0); v[k][2] = z + (cc[2] ? z1 : z0); }
-      vertexLightAO(x, y, z, f, 0, scratch);
+      vertexLightAO(x, y, z, f, scratch);
       builder.quad(v, uvs || f.uv, layer, overlay, fr, scratch.light, tint, f.shade, scratch.ao);
     }
-    var faceUV = [];
+    // small box helper (used by torch/lantern): px coordinates 0..16 for uv rects [u0,v0,u1,v1]
+    function boxModel(x, y, z, x0, y0, z0, x1, y1, z1, layer, uvRects, lt, builder) {
+      for (var f = 0; f < 6; f++) {
+        var F = FACE[f]; var r = uvRects[f];
+        var uvs = [[r[0] / 16, r[3] / 16], [r[2] / 16, r[3] / 16], [r[2] / 16, r[1] / 16], [r[0] / 16, r[1] / 16]];
+        for (var k = 0; k < 4; k++) { var cc = F.c[k]; v[k][0] = x + (cc[0] ? x1 : x0); v[k][1] = y + (cc[1] ? y1 : y0); v[k][2] = z + (cc[2] ? z1 : z0); }
+        builder.quad(v, uvs, layer, 0, 1, lt, WHITE, F.shade, flatAO);
+      }
+    }
+    function torchModel(x, y, z, meta, layer, lt, builder) {
+      // meta 0 = floor, 1..4 = on wall (attached to -x,+x,-z,+z)
+      var x0 = 7 / 16, x1 = 9 / 16, y0 = 0, y1 = 10 / 16, z0 = 7 / 16, z1 = 9 / 16;
+      var uvSide = [7 / 16, 6 / 16, 9 / 16, 16 / 16], uvTop = [7 / 16, 6 / 16, 9 / 16, 8 / 16];
+      var tilt = 0, dx = 0, dz = 0;
+      if (meta === 1) { tilt = 1; dx = -0.4; } else if (meta === 2) { tilt = 2; dx = 0.4; } else if (meta === 3) { tilt = 3; dz = -0.4; } else if (meta === 4) { tilt = 4; dz = 0.4; }
+      for (var f = 0; f < 6; f++) {
+        var F = FACE[f]; var r = (f === 2 || f === 3) ? uvTop : uvSide;
+        var uvs = [[r[0], r[3]], [r[2], r[3]], [r[2], r[1]], [r[0], r[1]]];
+        for (var k = 0; k < 4; k++) {
+          var cc = F.c[k]; var px = (cc[0] ? x1 : x0) - 0.5, py = (cc[1] ? y1 : y0), pz = (cc[2] ? z1 : z0) - 0.5;
+          if (tilt) { var ang = 0.4; var s = Math.sin(ang), co = Math.cos(ang); var nx, ny, nz; if (tilt === 1) { nx = px * co + py * s; ny = py * co - px * s; px = nx; py = ny; } else if (tilt === 2) { nx = px * co - py * s; ny = py * co + px * s; px = nx; py = ny; } else if (tilt === 3) { nz = pz * co + py * s; ny = py * co - pz * s; pz = nz; py = ny; } else { nz = pz * co - py * s; ny = py * co + pz * s; pz = nz; py = ny; } py += 3 / 16; }
+          v[k][0] = x + 0.5 + px + dx; v[k][1] = y + py; v[k][2] = z + 0.5 + pz + dz;
+        }
+        builder.quad(v, uvs, layer, 0, 1, lt, WHITE, F.shade, flatAO);
+      }
+    }
+    // Everything above c.maxH is air by construction, so there is no point walking it.
+    var yTop = Math.min(H - 1, c.maxH);
     for (var lx = 0; lx < 16; lx++) for (var lz = 0; lz < 16; lz++) {
       var ci = lx * 16 + lz; var base = ci << 7;
       var x = ox + lx, z = oz + lz;
-      for (var y = 0; y < H; y++) {
+      for (var y = 0; y <= yTop; y++) {
         var id = bl[base + y]; if (id === AIR) continue;
         var B = BLOCKS[id]; var layers = faceLayer[id];
         var model = B.model;
+        var f, F, nb, NB, k, cc;
         if (model === 'cube') {
           var tint = tintColorFor(B.tint, tints, ci);
           var fr = B.anim || 1;
-          for (var f = 0; f < 6; f++) {
-            var F = FACE[f]; var nb = gb(x + F.n[0], y + F.n[1], z + F.n[2]);
+          var leafy = isLeaves[id];
+          for (f = 0; f < 6; f++) {
+            F = FACE[f]; nb = gb(x + F.n[0], y + F.n[1], z + F.n[2]);
             if (nb === -1) continue;
-            var NB = BLOCKS[nb];
+            NB = BLOCKS[nb];
             if (NB.opaque) continue;
-            if (nb === id && (B.translucent || B.cutout) && B.name !== 'oak_leaves' && !(/leaves/).test(B.name)) continue; // glass-glass, ice-ice
-            if (nb === id && (/leaves/).test(B.name)) { /* fancy leaves render inner faces */ }
+            // glass-glass / ice-ice: skip the shared face. Fancy leaves keep inner faces.
+            if (nb === id && (B.translucent || B.cutout) && !leafy) continue;
             var overlay = 0, faceTint = tint, layer = layers[f];
-            if (B.sideOverlay) { if (f === 2) { faceTint = tint; } else if (f === 3) { faceTint = WHITE; } else { overlay = texIndex.grass_block_side_overlay; faceTint = tint; } }
+            if (B.sideOverlay) { if (f === 3) faceTint = WHITE; else if (f !== 2) overlay = texIndex.grass_block_side_overlay; }
             else if (B.tint === 'grass' && f === 3) faceTint = WHITE;
             var builder = B.translucent ? waterB : (B.cutout ? cutoutB : opaqueB);
-            var uvs = F.uv;
-            if (B.hasMeta && (/_log$/).test(B.name)) { var axis = c.meta[base + y]; if (axis === 1) { layer = (f === 0 || f === 1) ? layers[2] : layers[0]; } else if (axis === 2) { layer = (f === 4 || f === 5) ? layers[2] : layers[0]; } }
-            if (B.hasMeta && (B.name === 'furnace' || B.name === 'crafting_table' || B.name === 'jack_o_lantern' || B.name === 'carved_pumpkin' || B.name === 'chest')) { var facing = c.meta[base + y] & 3; var frontFace = [4, 1, 5, 0][facing]; layer = f === frontFace ? layers[4] : (f === 2 || f === 3 ? layers[f] : layers[0]); }
-            cubeFace(x, y, z, F, layer, overlay, fr, faceTint, builder, 0, 0, 0, 1, 1, 1, uvs);
+            if (B.hasMeta && isLog[id]) { var axis = c.meta[base + y]; if (axis === 1) layer = (f === 0 || f === 1) ? layers[2] : layers[0]; else if (axis === 2) layer = (f === 4 || f === 5) ? layers[2] : layers[0]; }
+            else if (B.hasMeta && isDirectional[id]) { var facing = c.meta[base + y] & 3; var frontFace = FRONT_FACE[facing]; layer = f === frontFace ? layers[4] : (f === 2 || f === 3 ? layers[f] : layers[0]); }
+            cubeFace(x, y, z, F, layer, overlay, fr, faceTint, builder, 0, 0, 0, 1, 1, 1, F.uv);
           }
         } else if (model === 'liquid') {
           var above = gb(x, y + 1, z); var isTop = above !== id;
@@ -599,7 +715,7 @@ MC.WorkerSource = function workerMain(ns) {
             if (nb === id) continue; if (NB.opaque && f !== 2) continue; if (f === 2 && !isTop) continue;
             if (NB.solid && NB.fullCube && f !== 2) continue;
             var lt = selfLight(x, y, z);
-            for (var k = 0; k < 4; k++) { var cc = F.c[k]; v[k][0] = x + cc[0]; v[k][1] = y + (cc[1] ? hgt : 0); v[k][2] = z + cc[2]; }
+            for (k = 0; k < 4; k++) { cc = F.c[k]; v[k][0] = x + cc[0]; v[k][1] = y + (cc[1] ? hgt : 0); v[k][2] = z + cc[2]; }
             waterB.quad(v, F.uv, layers[f], 0, wfr, lt, wt, F.shade, flatAO);
           }
         } else if (model === 'cross') {
@@ -607,72 +723,57 @@ MC.WorkerSource = function workerMain(ns) {
           var offx = 0, offz = 0;
           if (B.randomOffset) { var hsh = ns.hash3i(x, 0, z, seed); offx = (hsh - 0.5) * 0.5; offz = (((hsh * 7919) % 1) - 0.5) * 0.5; }
           var lay = layers[0];
-          var q1 = [[x + 0.15 + offx, y, z + 0.15 + offz], [x + 0.85 + offx, y, z + 0.85 + offz], [x + 0.85 + offx, y + 1, z + 0.85 + offz], [x + 0.15 + offx, y + 1, z + 0.15 + offz]];
-          var q2 = [[x + 0.85 + offx, y, z + 0.15 + offz], [x + 0.15 + offx, y, z + 0.85 + offz], [x + 0.15 + offx, y + 1, z + 0.85 + offz], [x + 0.85 + offx, y + 1, z + 0.15 + offz]];
-          var suv = [[0, 1], [1, 1], [1, 0], [0, 0]];
-          cutoutB.quad(q1, suv, lay, 0, 1, lt2, pt, 1.0, flatAO); cutoutB.quad(q2, suv, lay, 0, 1, lt2, pt, 1.0, flatAO);
+          CROSS_A[0][0] = x + 0.15 + offx; CROSS_A[0][1] = y; CROSS_A[0][2] = z + 0.15 + offz;
+          CROSS_A[1][0] = x + 0.85 + offx; CROSS_A[1][1] = y; CROSS_A[1][2] = z + 0.85 + offz;
+          CROSS_A[2][0] = x + 0.85 + offx; CROSS_A[2][1] = y + 1; CROSS_A[2][2] = z + 0.85 + offz;
+          CROSS_A[3][0] = x + 0.15 + offx; CROSS_A[3][1] = y + 1; CROSS_A[3][2] = z + 0.15 + offz;
+          CROSS_B[0][0] = x + 0.85 + offx; CROSS_B[0][1] = y; CROSS_B[0][2] = z + 0.15 + offz;
+          CROSS_B[1][0] = x + 0.15 + offx; CROSS_B[1][1] = y; CROSS_B[1][2] = z + 0.85 + offz;
+          CROSS_B[2][0] = x + 0.15 + offx; CROSS_B[2][1] = y + 1; CROSS_B[2][2] = z + 0.85 + offz;
+          CROSS_B[3][0] = x + 0.85 + offx; CROSS_B[3][1] = y + 1; CROSS_B[3][2] = z + 0.15 + offz;
+          cutoutB.quad(CROSS_A, SPRITE_UV, lay, 0, 1, lt2, pt, 1.0, flatAO);
+          cutoutB.quad(CROSS_B, SPRITE_UV, lay, 0, 1, lt2, pt, 1.0, flatAO);
         } else if (model === 'torch') {
-          var meta = c.meta[base + y]; var lt3 = selfLight(x, y, z);
-          torchModel(x, y, z, meta, layers[0], lt3, cutoutB);
+          torchModel(x, y, z, c.meta[base + y], layers[0], selfLight(x, y, z), cutoutB);
         } else if (model === 'lantern') {
           var lt4 = selfLight(x, y, z);
-          boxModel(x, y, z, 5 / 16, 0, 5 / 16, 11 / 16, 7 / 16, 11 / 16, layers[0], [[5, 6, 11, 13], [5, 6, 11, 13], [5, 4, 11, 10], [5, 4, 11, 10], [5, 6, 11, 13], [5, 6, 11, 13]], lt4, cutoutB);
-          boxModel(x, y, z, 7 / 16, 7 / 16, 7 / 16, 9 / 16, 9 / 16, 9 / 16, layers[0], [[7, 4, 9, 6], [7, 4, 9, 6], [7, 4, 9, 6], [7, 4, 9, 6], [7, 4, 9, 6], [7, 4, 9, 6]], lt4, cutoutB);
+          boxModel(x, y, z, 5 / 16, 0, 5 / 16, 11 / 16, 7 / 16, 11 / 16, layers[0], LANTERN_BODY_UV, lt4, cutoutB);
+          boxModel(x, y, z, 7 / 16, 7 / 16, 7 / 16, 9 / 16, 9 / 16, 9 / 16, layers[0], LANTERN_TOP_UV, lt4, cutoutB);
         } else if (model === 'cactus') {
           for (f = 0; f < 6; f++) {
             F = FACE[f]; nb = gb(x + F.n[0], y + F.n[1], z + F.n[2]); if (nb === -1) continue;
-            if ((f === 2 || f === 3) && nb === id) continue; if ((f === 2 || f === 3) && BLOCKS[nb].opaque) continue;
+            if ((f === 2 || f === 3) && (nb === id || BLOCKS[nb].opaque)) continue;
             var inset = (f === 2 || f === 3) ? 0 : 1 / 16;
             for (k = 0; k < 4; k++) { cc = F.c[k]; v[k][0] = x + (cc[0] ? 1 - (F.n[0] ? inset : 0) : (F.n[0] ? inset : 0)); v[k][1] = y + cc[1]; v[k][2] = z + (cc[2] ? 1 - (F.n[2] ? inset : 0) : (F.n[2] ? inset : 0)); }
-            var ltc = selfLight(x, y, z);
-            cutoutB.quad(v, F.uv, layers[f], 0, 1, ltc, WHITE, F.shade, flatAO);
+            cutoutB.quad(v, F.uv, layers[f], 0, 1, selfLight(x, y, z), WHITE, F.shade, flatAO);
           }
         } else if (model === 'layer') {
           for (f = 0; f < 6; f++) {
-            F = FACE[f]; nb = gb(x + F.n[0], y + F.n[1], z + F.n[2]); if (nb === -1) continue; if (f === 3 && BLOCKS[nb].opaque) continue; if (f !== 2 && f !== 3 && (BLOCKS[nb].opaque || nb === id)) continue;
-            var ltl = selfLight(x, y, z);
-            var uvl = f === 2 || f === 3 ? F.uv : [[0, 1], [1, 1], [1, 1 - 2 / 16], [0, 1 - 2 / 16]];
+            F = FACE[f]; nb = gb(x + F.n[0], y + F.n[1], z + F.n[2]); if (nb === -1) continue;
+            if (f === 3 && BLOCKS[nb].opaque) continue;
+            if (f !== 2 && f !== 3 && (BLOCKS[nb].opaque || nb === id)) continue;
+            var uvl = (f === 2 || f === 3) ? F.uv : LAYER_SIDE_UV;
             for (k = 0; k < 4; k++) { cc = F.c[k]; v[k][0] = x + cc[0]; v[k][1] = y + (cc[1] ? 2 / 16 : 0); v[k][2] = z + cc[2]; }
-            opaqueB.quad(v, uvl, layers[f], 0, 1, ltl, WHITE, F.shade, flatAO);
+            opaqueB.quad(v, uvl, layers[f], 0, 1, selfLight(x, y, z), WHITE, F.shade, flatAO);
           }
         } else if (model === 'petals') {
-          var ltp = selfLight(x, y, z); var F2 = FACE[2];
+          var F2 = FACE[2];
           for (k = 0; k < 4; k++) { cc = F2.c[k]; v[k][0] = x + cc[0]; v[k][1] = y + 1 / 16; v[k][2] = z + cc[2]; }
-          cutoutB.quad(v, F2.uv, layers[2], 0, 1, ltp, WHITE, 1.0, flatAO);
+          cutoutB.quad(v, F2.uv, layers[2], 0, 1, selfLight(x, y, z), WHITE, 1.0, flatAO);
         }
-      }
-    }
-    // small box helper (used by torch/lantern): px coordinates 0..16 for uv rects [u0,v0,u1,v1]
-    function boxModel(x, y, z, x0, y0, z0, x1, y1, z1, layer, uvRects, lt, builder) {
-      for (var f = 0; f < 6; f++) {
-        var F = FACE[f]; var r = uvRects[f];
-        var uvs = [[r[0] / 16, r[3] / 16], [r[2] / 16, r[3] / 16], [r[2] / 16, r[1] / 16], [r[0] / 16, r[1] / 16]];
-        if (f === 2 || f === 3) uvs = [[r[0] / 16, r[3] / 16], [r[2] / 16, r[3] / 16], [r[2] / 16, r[1] / 16], [r[0] / 16, r[1] / 16]];
-        for (var k = 0; k < 4; k++) { var cc = F.c[k]; v[k][0] = x + (cc[0] ? x1 : x0); v[k][1] = y + (cc[1] ? y1 : y0); v[k][2] = z + (cc[2] ? z1 : z0); }
-        builder.quad(v, uvs, layer, 0, 1, lt, WHITE, F.shade, flatAO);
-      }
-    }
-    function torchModel(x, y, z, meta, layer, lt, builder) {
-      // meta 0 = floor, 1..4 = on wall (attached to -x,+x,-z,+z)
-      var pts = [];
-      var x0 = 7 / 16, x1 = 9 / 16, y0 = 0, y1 = 10 / 16, z0 = 7 / 16, z1 = 9 / 16;
-      var uvSide = [7 / 16, 6 / 16, 9 / 16, 16 / 16], uvTop = [7 / 16, 6 / 16, 9 / 16, 8 / 16];
-      var tilt = 0, dx = 0, dz = 0;
-      if (meta === 1) { tilt = 1; dx = -0.4; } else if (meta === 2) { tilt = 2; dx = 0.4; } else if (meta === 3) { tilt = 3; dz = -0.4; } else if (meta === 4) { tilt = 4; dz = 0.4; }
-      for (var f = 0; f < 6; f++) {
-        var F = FACE[f]; var r = (f === 2 || f === 3) ? uvTop : uvSide;
-        var uvs = [[r[0], r[3]], [r[2], r[3]], [r[2], r[1]], [r[0], r[1]]];
-        for (var k = 0; k < 4; k++) {
-          var cc = F.c[k]; var px = (cc[0] ? x1 : x0) - 0.5, py = (cc[1] ? y1 : y0), pz = (cc[2] ? z1 : z0) - 0.5;
-          if (tilt) { var ang = 0.4; var s = Math.sin(ang), co = Math.cos(ang); if (tilt === 1) { var nx = px * co + py * s, ny = py * co - px * s; px = nx; py = ny; } else if (tilt === 2) { nx = px * co - py * s; ny = py * co + px * s; px = nx; py = ny; } else if (tilt === 3) { var nz = pz * co + py * s; ny = py * co - pz * s; pz = nz; py = ny; } else { nz = pz * co - py * s; ny = py * co + pz * s; pz = nz; py = ny; } py += 3 / 16; }
-          v[k][0] = x + 0.5 + px + dx; v[k][1] = y + py; v[k][2] = z + 0.5 + pz + dz;
-        }
-        builder.quad(v, uvs, layer, 0, 1, lt, WHITE, F.shade, flatAO);
       }
     }
     c.meshed = true; c.dirty = false;
     return { opaque: opaqueB.pack(), cutout: cutoutB.pack(), water: waterB.pack() };
   }
+  // hoisted mesh constants / scratch
+  var FRONT_FACE = [4, 1, 5, 0];
+  var SPRITE_UV = [[0, 1], [1, 1], [1, 0], [0, 0]];
+  var CROSS_A = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  var CROSS_B = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  var LAYER_SIDE_UV = [[0, 1], [1, 1], [1, 1 - 2 / 16], [0, 1 - 2 / 16]];
+  var LANTERN_BODY_UV = [[5, 6, 11, 13], [5, 6, 11, 13], [5, 4, 11, 10], [5, 4, 11, 10], [5, 6, 11, 13], [5, 6, 11, 13]];
+  var LANTERN_TOP_UV = [[7, 4, 9, 6], [7, 4, 9, 6], [7, 4, 9, 6], [7, 4, 9, 6], [7, 4, 9, 6], [7, 4, 9, 6]];
 
   // ---------------- scheduling ----------------
   function neighborsGenerated(cx, cz) { for (var dx = -1; dx <= 1; dx++) for (var dz = -1; dz <= 1; dz++) { var c = chunks.get(key(cx + dx, cz + dz)); if (!c || !c.generated) return false; } return true; }
@@ -682,7 +783,7 @@ MC.WorkerSource = function workerMain(ns) {
     for (var dx = -R - 1; dx <= R + 1; dx++) for (var dz = -R - 1; dz <= R + 1; dz++) {
       var cx = center.cx + dx, cz = center.cz + dz; var d = Math.max(Math.abs(dx), Math.abs(dz));
       var c = chunks.get(key(cx, cz));
-      if (!c) { genQueue.push({ cx: cx, cz: cz, d: d }); }
+      if (!c) genQueue.push({ cx: cx, cz: cz, d: d });
       if (d <= R) { if (!c || !c.meshed || c.dirty) meshQueue.push({ cx: cx, cz: cz, d: d }); }
     }
     genQueue.sort(function (a, b) { return a.d - b.d; }); meshQueue.sort(function (a, b) { return a.d - b.d; });
@@ -696,6 +797,7 @@ MC.WorkerSource = function workerMain(ns) {
     var blocks = c.blocks.slice(0), meta = c.meta.slice(0), heights = c.heights.slice(0), biomes = c.biomes.slice(0), topSolid = c.topSolid.slice(0);
     postMessage({ type: 'chunk', cx: c.cx, cz: c.cz, blocks: blocks.buffer, meta: meta.buffer, heights: heights.buffer, biomes: biomes.buffer, topSolid: topSolid.buffer }, [blocks.buffer, meta.buffer, heights.buffer, biomes.buffer, topSolid.buffer]);
   }
+  var MESH_PARTS = ['opaque', 'cutout', 'water'];
   function postMesh(c) {
     var t0 = Date.now();
     if (!c.lit) lightChunk(c);
@@ -704,19 +806,22 @@ MC.WorkerSource = function workerMain(ns) {
     STATS.meshMs += Date.now() - t1; STATS.meshN++;
     var light = c.light.slice(0);
     var transfer = [light.buffer];
-    ['opaque', 'cutout', 'water'].forEach(function (k) { var p = m[k]; if (p) transfer.push(p.pos.buffer, p.uv.buffer, p.data.buffer, p.col.buffer, p.idx.buffer); });
+    for (var i = 0; i < MESH_PARTS.length; i++) { var p = m[MESH_PARTS[i]]; if (p) transfer.push(p.pos.buffer, p.uv.buffer, p.data.buffer, p.col.buffer, p.idx.buffer); }
     postMessage({ type: 'mesh', cx: c.cx, cz: c.cz, parts: m, light: light.buffer }, transfer);
     dirtySet.delete(c);
   }
-  var progressTotal = 0;
   function pump() {
     pumping = false;
     var start = Date.now(); var did = false;
     // 1. dirty (edited) chunks first
-    if (dirtySet.size) { var arr = Array.from(dirtySet); for (var i = 0; i < arr.length; i++) { var c = arr[i]; if (c.generated && neighborsGenerated(c.cx, c.cz)) postMesh(c); else dirtySet.delete(c); } did = true; }
+    if (dirtySet.size) {
+      var arr = Array.from(dirtySet);
+      for (var i = 0; i < arr.length; i++) { var c = arr[i]; if (c.generated && neighborsGenerated(c.cx, c.cz)) postMesh(c); else dirtySet.delete(c); }
+      did = true;
+    }
     while (Date.now() - start < 12) {
       var worked = false;
-      // 2. mesh the nearest ready chunk (neighbors generated) — keeps the spawn area appearing first
+      // 2. mesh the nearest ready chunk (neighbors generated) -- keeps the spawn area appearing first
       for (var j = 0; j < meshQueue.length; j++) {
         var m = meshQueue[j]; var mc = chunks.get(key(m.cx, m.cz));
         if (mc && mc.meshed && !mc.dirty) { meshQueue.splice(j, 1); j--; continue; }
@@ -727,13 +832,13 @@ MC.WorkerSource = function workerMain(ns) {
       // 3. generation (nearest first)
       if (!worked && genQueue.length) {
         var g = genQueue.shift();
-        if (!chunks.has(key(g.cx, g.cz))) { var t0 = Date.now(); var nc = generate(g.cx, g.cz); STATS.genMs += Date.now() - t0; STATS.genN++; chunks.set(key(g.cx, g.cz), nc); invalidateChunkCache(); postChunk(nc); worked = true; }
-        else worked = true;
+        if (!chunks.has(key(g.cx, g.cz))) { var t0 = Date.now(); var nc = generate(g.cx, g.cz); STATS.genMs += Date.now() - t0; STATS.genN++; chunks.set(key(g.cx, g.cz), nc); invalidateChunkCache(); postChunk(nc); }
+        worked = true;
       }
-      if (!worked) break; did = true;
+      if (!worked) break;
+      did = true;
     }
-    var pending = meshQueue.length;
-    postMessage({ type: 'progress', pending: pending, gen: genQueue.length, stats: STATS });
+    postMessage({ type: 'progress', pending: meshQueue.length, gen: genQueue.length, stats: STATS });
     if (genQueue.length || meshQueue.length || dirtySet.size) schedule();
   }
   function schedule() { if (!pumping) { pumping = true; setTimeout(pump, 0); } }
@@ -764,7 +869,6 @@ MC.WorkerSource = function workerMain(ns) {
         schedule(); break;
       }
       case 'query':
-        // debug: return block at pos
         postMessage({ type: 'query', id: getBlock(m.x, m.y, m.z), sky: getSky(m.x, m.y, m.z), blk: getBlockLight(m.x, m.y, m.z) }); break;
     }
   };

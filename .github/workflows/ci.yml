@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    name: parse check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: node --check every hand-written source file
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            if node --check "$f" 2>/tmp/err; then
+              echo "ok    $f"
+            else
+              echo "FAIL  $f"
+              cat /tmp/err
+              fail=1
+            fi
+          done < <(find js -name '*.js' ! -name 'three.min.js' | sort)
+          exit $fail
+
+      - name: every <script src> in Minecraft.html exists
+        run: |
+          fail=0
+          for src in $(grep -o 'script src="[^"]*"' Minecraft.html | sed 's/script src="//; s/"$//'); do
+            if [ -f "$src" ]; then echo "ok    $src"; else echo "MISSING $src"; fail=1; fi
+          done
+          exit $fail

@@ -1,6 +1,17 @@
 // Player: 20-TPS Minecraft-style physics, controls, inventory, health/hunger/xp, mining & placing.
 (function () {
   var TICK = 1 / 20;
+  var DIGITS = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9'];
+  // XP dropped per ore. Was an object literal rebuilt on every single block break.
+  var ORE_XP = { coal_ore: 1, diamond_ore: 5, emerald_ore: 5, lapis_ore: 3, redstone_ore: 3 };
+  var PLANT_SOIL = { grass_block: 1, dirt: 1, podzol: 1, coarse_dirt: 1, moss_block: 1 };
+  var CACTUS_SOIL = { sand: 1, red_sand: 1, cactus: 1 };
+  var BUSH_SOIL = { sand: 1, red_sand: 1, dirt: 1, coarse_dirt: 1, terracotta: 1 };
+  var DIRECTIONAL = { furnace: 1, crafting_table: 1, jack_o_lantern: 1, carved_pumpkin: 1, chest: 1 };
+  var FLOWER_RE = /tulip|dandelion|poppy|orchid|allium|bluet|daisy|cornflower|lily/;
+  // Scratch vectors: the interaction/placement paths run every frame.
+  var _eye = new THREE.Vector3(), _dir = new THREE.Vector3();
+  var _eye2 = new THREE.Vector3(), _dir2 = new THREE.Vector3(), _tmp = new THREE.Vector3();
 
   function Inventory(size) { this.slots = []; for (var i = 0; i < size; i++) this.slots.push(null); }
   Inventory.prototype.maxStack = function (id) { var it = MC.ITEMS[id]; return it ? it.stack : 64; };
@@ -30,18 +41,30 @@
     this.inventory = new Inventory(41); this.selected = 0;
     this.fallDist = 0; this.walkDist = 0; this.prevWalkDist = 0; this.nextStep = 1; this.bob = 0; this.prevBob = 0; this.jumpCooldown = 0; this.sprintToggle = false; this.collidedH = false;
     this.swing = 0; this.swinging = false; this.equip = 0; this.lastSelected = 0; this.lastHeldId = null;
-    this.hurtTime = 0; this.hurtYaw = 0; this.invuln = 0; this.regenTimer = 0; this.foodTimer = 0; this.fireTicks = 0;
+    this.hurtTime = 0; this.hurtYaw = 0; this.invuln = 0; this.regenTimer = 0; this.foodTimer = 0; this.fireTicks = 0; this.magmaTimer = 0;
     this.mining = { target: null, progress: 0, cooldown: 0, sinceSound: 0 };
     this.useCooldown = 0; this.eating = 0; this.eatingItem = null; this.attackCooldown = 0;
-    this.target = null; this.lastJumpTap = -10; this.lastForwardTap = -10; this.acc = 0; this.controlsEnabled = true; this.spawn = new THREE.Vector3(0.5, 70, 0.5);
-    this.time = 0; this.armorPointsCache = 0; this.reach = 4.5; this.autoJump = false;
+    this.target = null; this.targetMob = null; this.lastJumpTap = -10; this.lastForwardTap = -10; this.acc = 0; this.controlsEnabled = true; this.spawn = new THREE.Vector3(0.5, 70, 0.5);
+    this.time = 0; this.reach = 4.5; this.autoJump = false;
+    this.boxes = []; // persistent collision scratch (World.collectBoxes recycles into it)
+    this.edgeBoxes = [];
   }
   Player.prototype.setGameMode = function (m) { this.gameMode = m; if (m === 'survival') this.flying = false; this.reach = m === 'creative' ? 5 : 4.5; };
   Player.prototype.isCreative = function () { return this.gameMode === 'creative'; };
   Player.prototype.held = function () { return this.inventory.slots[this.selected]; };
-  Player.prototype.getEyePos = function (alpha) { var p = this.renderPos(alpha === undefined ? 1 : alpha); p.y += this.eyeHeight; return p; };
+  // Allocating variants (callers that keep/mutate the result) ...
   Player.prototype.renderPos = function (alpha) { return this.prevPos.clone().lerp(this.pos, alpha); };
-  Player.prototype.getLookDir = function () { var cp = Math.cos(this.pitch); return new THREE.Vector3(-Math.sin(this.yaw) * cp, -Math.sin(this.pitch), -Math.cos(this.yaw) * cp); };
+  Player.prototype.getEyePos = function (alpha) { var p = this.renderPos(alpha === undefined ? 1 : alpha); p.y += this.eyeHeight; return p; };
+  Player.prototype.getLookDir = function () { return this.getLookDirInto(new THREE.Vector3()); };
+  // ... and allocation-free variants for the per-frame paths.
+  Player.prototype.getEyePosInto = function (out, alpha) {
+    if (alpha === undefined || alpha === 1) out.copy(this.pos); else out.copy(this.prevPos).lerp(this.pos, alpha);
+    out.y += this.eyeHeight; return out;
+  };
+  Player.prototype.getLookDirInto = function (out) {
+    var cp = Math.cos(this.pitch);
+    return out.set(-Math.sin(this.yaw) * cp, -Math.sin(this.pitch), -Math.cos(this.yaw) * cp);
+  };
   Player.prototype.armorPoints = function () { var n = 0; for (var i = 36; i < 40; i++) { var s = this.inventory.slots[i]; if (s && MC.ITEMS[s.id] && MC.ITEMS[s.id].armor) n += MC.ITEMS[s.id].armor.points; } return n; };
 
   Player.prototype.look = function (dx, dy, sensitivity) {
@@ -96,11 +119,12 @@
     this.sneaking = sneak && !this.flying;
     this.height = this.sneaking ? 1.5 : 1.8; this.eyeHeight = this.sneaking ? 1.27 : 1.62;
     // water state
-    var feet = this.world.getBlock(Math.floor(this.pos.x), Math.floor(this.pos.y + 0.2), Math.floor(this.pos.z));
-    var eye = this.world.getBlock(Math.floor(this.pos.x), Math.floor(this.pos.y + this.eyeHeight), Math.floor(this.pos.z));
+    var fx0 = Math.floor(this.pos.x), fz0 = Math.floor(this.pos.z);
+    var feet = this.world.getBlock(fx0, Math.floor(this.pos.y + 0.2), fz0);
+    var eyeBlock = this.world.getBlock(fx0, Math.floor(this.pos.y + this.eyeHeight), fz0);
     var wasInWater = this.inWater;
-    this.inWater = feet === MC.BLOCK.water.id || this.world.getBlock(Math.floor(this.pos.x), Math.floor(this.pos.y + 0.8), Math.floor(this.pos.z)) === MC.BLOCK.water.id;
-    this.headInWater = eye === MC.BLOCK.water.id;
+    this.inWater = feet === MC.BLOCK.water.id || this.world.getBlock(fx0, Math.floor(this.pos.y + 0.8), fz0) === MC.BLOCK.water.id;
+    this.headInWater = eyeBlock === MC.BLOCK.water.id;
     this.inLava = feet === MC.BLOCK.lava.id;
     if (this.inWater && !wasInWater && this.vel.y < -0.2) { MC.Audio.play('player.splash', { volume: Math.min(1, -this.vel.y) }); MC.Particles.splash(this.pos.x, Math.floor(this.pos.y + 0.2) + 0.9, this.pos.z, 12); }
     // input vector (normalized)
@@ -115,11 +139,9 @@
       var vy = jump ? 0.25 : (sneak ? -0.25 : 0); v.y += (vy - v.y) * 0.4;
       this.moveEntity(); this.fallDist = 0;
       if (this.onGround && !jump && !this.isCreative()) this.flying = false;
-    } else if (this.inWater && !this.headInWater && false) {
     } else if (this.inWater || this.inLava) {
       var ws = this.inLava ? 0.01 : 0.02;
       v.x += dirX * ws; v.z += dirZ * ws;
-      var startY = this.pos.y;
       this.moveEntity();
       v.x *= 0.8; v.z *= 0.8; v.y *= 0.8; v.y -= 0.02;
       if (jump) v.y += 0.04;
@@ -154,19 +176,23 @@
   };
   Player.prototype.groundSound = function () { var id = this.world.getBlock(Math.floor(this.pos.x), Math.floor(this.pos.y - 0.2), Math.floor(this.pos.z)); if (id <= 0) return 'stone'; var s = MC.BLOCKS[id].sound; return s === 'none' ? 'stone' : s; };
   Player.prototype.canStepOut = function () {
-    var dir = this.getLookDir(); var x = Math.floor(this.pos.x + dir.x * 0.7), z = Math.floor(this.pos.z + dir.z * 0.7), y = Math.floor(this.pos.y + 0.6);
+    var dir = this.getLookDirInto(_dir2);
+    var x = Math.floor(this.pos.x + dir.x * 0.7), z = Math.floor(this.pos.z + dir.z * 0.7), y = Math.floor(this.pos.y + 0.6);
     var id = this.world.getBlock(x, y, z); var id2 = this.world.getBlock(x, y + 1, z);
     return id > 0 && MC.BLOCKS[id].solid && (id2 <= 0 || !MC.BLOCKS[id2].solid);
   };
-  Player.prototype.applySneakEdge = function () {
-    var w = this.width / 2, v = this.vel; var step = 0.05;
-    function ground(self, x, z) { var boxes = []; self.world.collectBoxes(x - w, self.pos.y - 0.6, z - w, x + w, self.pos.y - 0.01, z + w, boxes); return boxes.length > 0; }
-    if (v.x !== 0 && !ground(this, this.pos.x + v.x + Math.sign(v.x) * step, this.pos.z)) v.x = 0;
-    if (v.z !== 0 && !ground(this, this.pos.x, this.pos.z + v.z + Math.sign(v.z) * step)) v.z = 0;
+  Player.prototype.hasGroundAt = function (x, z) {
+    var w = this.width / 2;
+    this.world.collectBoxes(x - w, this.pos.y - 0.6, z - w, x + w, this.pos.y - 0.01, z + w, this.edgeBoxes);
+    return this.edgeBoxes.length > 0;
   };
-  var boxes = [];
+  Player.prototype.applySneakEdge = function () {
+    var v = this.vel, step = 0.05;
+    if (v.x !== 0 && !this.hasGroundAt(this.pos.x + v.x + Math.sign(v.x) * step, this.pos.z)) v.x = 0;
+    if (v.z !== 0 && !this.hasGroundAt(this.pos.x, this.pos.z + v.z + Math.sign(v.z) * step)) v.z = 0;
+  };
   Player.prototype.moveEntity = function () {
-    var w = this.width / 2, h = this.height, p = this.pos, v = this.vel; var world = this.world;
+    var w = this.width / 2, h = this.height, p = this.pos, v = this.vel; var world = this.world; var boxes = this.boxes;
     this.collidedH = false;
     var dy = v.y;
     world.collectBoxes(p.x - w, p.y + Math.min(0, dy) - 0.01, p.z - w, p.x + w, p.y + h + Math.max(0, dy), p.z + w, boxes);
@@ -186,14 +212,16 @@
     for (i = 0; i < boxes.length; i++) { b = boxes[i]; if (p.y + h <= b[1] + 1e-6 || p.y >= b[4] - 1e-6 || p.x + w <= b[0] || p.x - w >= b[3]) continue; if (dz > 0 && p.z + w <= b[2] + 1e-6 && p.z + w + dz > b[2]) { dz = b[2] - (p.z + w); v.z = 0; this.collidedH = true; } else if (dz < 0 && p.z - w >= b[5] - 1e-6 && p.z - w + dz < b[5]) { dz = b[5] - (p.z - w); v.z = 0; this.collidedH = true; } }
     p.z += dz;
     // auto-jump / step for 1-block ledges when enabled
-    if (this.autoJump && this.collidedH && this.onGround && !this.sneaking && (Math.abs(this.vel.x) + Math.abs(this.vel.z) > 0 || true)) {
-      var dir = this.getLookDir(); var fx = Math.floor(p.x + dir.x * 0.6), fz = Math.floor(p.z + dir.z * 0.6), fy = Math.floor(p.y + 0.5);
+    if (this.autoJump && this.collidedH && this.onGround && !this.sneaking) {
+      var dir = this.getLookDirInto(_dir2);
+      var fx = Math.floor(p.x + dir.x * 0.6), fz = Math.floor(p.z + dir.z * 0.6), fy = Math.floor(p.y + 0.5);
       var b1 = world.getBlock(fx, fy, fz), b2 = world.getBlock(fx, fy + 1, fz), b3 = world.getBlock(fx, fy + 2, fz);
       if (b1 > 0 && MC.BLOCKS[b1].solid && (b2 <= 0 || !MC.BLOCKS[b2].solid) && (b3 <= 0 || !MC.BLOCKS[b3].solid)) this.vel.y = 0.42;
     }
   };
   Player.prototype.land = function () {
-    var dmg = Math.floor(this.fallDist - 3);
+    // vanilla uses ceil(fallDistance - 3); floor under-reported damage by up to 1 heart
+    var dmg = Math.ceil(this.fallDist - 3);
     if (this.fallDist > 1.5) MC.Audio.play('player.fall', { volume: Math.min(1, this.fallDist / 8) });
     if (dmg > 0 && !this.isCreative()) this.hurt(dmg, 'fall');
   };
@@ -214,8 +242,16 @@
     // cactus / magma contact
     var fx = Math.floor(this.pos.x), fz = Math.floor(this.pos.z), fy = Math.floor(this.pos.y);
     var below = this.world.getBlock(fx, Math.floor(this.pos.y - 0.05), fz);
-    if (below === MC.BLOCK.magma_block.id && !this.sneaking && this.time % 1 < 0.05) this.hurt(1, 'magma');
-    for (var dx = -1; dx <= 1; dx++) for (var dz = -1; dz <= 1; dz++) { var id = this.world.getBlock(fx + dx, fy, fz + dz); if (id === MC.BLOCK.cactus.id) { var bx = fx + dx + 0.5, bz = fz + dz + 0.5; if (Math.abs(bx - this.pos.x) < 0.5 + this.width / 2 + 0.05 && Math.abs(bz - this.pos.z) < 0.5 + this.width / 2 + 0.05) { if (this.invuln <= 0) this.hurt(1, 'cactus'); } } }
+    // Once per second on magma. The old `this.time % 1 < 0.05` test compared an
+    // accumulating float against a window, so it fired erratically or never.
+    if (below === MC.BLOCK.magma_block.id && !this.sneaking) {
+      if (++this.magmaTimer >= 20) { this.magmaTimer = 0; this.hurt(1, 'magma'); }
+    } else this.magmaTimer = 0;
+    var reachX = 0.5 + this.width / 2 + 0.05;
+    for (var dx = -1; dx <= 1; dx++) for (var dz = -1; dz <= 1; dz++) {
+      if (this.world.getBlock(fx + dx, fy, fz + dz) !== MC.BLOCK.cactus.id) continue;
+      if (Math.abs(fx + dx + 0.5 - this.pos.x) < reachX && Math.abs(fz + dz + 0.5 - this.pos.z) < reachX && this.invuln <= 0) this.hurt(1, 'cactus');
+    }
     // suffocation
     var head = this.world.getBlock(fx, Math.floor(this.pos.y + this.eyeHeight), fz);
     if (head > 0 && MC.BLOCKS[head].opaque && MC.BLOCKS[head].fullCube && this.invuln <= 0) this.hurt(1, 'suffocate');
@@ -240,7 +276,7 @@
     if (this.game && this.game.onPlayerDeath) this.game.onPlayerDeath(source);
   };
   Player.prototype.respawn = function () {
-    this.dead = false; this.health = 20; this.hunger = 20; this.saturation = 5; this.exhaustion = 0; this.air = 300; this.fireTicks = 0; this.vel.set(0, 0, 0); this.fallDist = 0;
+    this.dead = false; this.health = 20; this.hunger = 20; this.saturation = 5; this.exhaustion = 0; this.air = 300; this.fireTicks = 0; this.magmaTimer = 0; this.vel.set(0, 0, 0); this.fallDist = 0;
     this.pos.copy(this.spawn); this.prevPos.copy(this.pos); this.xp = 0; this.level = 0; this.totalXp = 0;
   };
   Player.prototype.xpForLevel = function (L) { return L >= 30 ? 112 + (L - 30) * 9 : (L >= 15 ? 37 + (L - 15) * 5 : 7 + L * 2); };
@@ -249,27 +285,30 @@
 
   // ---- interaction (per frame) ----
   Player.prototype.updateInteraction = function (dt, input) {
-    var world = this.world; var eye = this.getEyePos(1); var dir = this.getLookDir();
+    var world = this.world;
+    var eye = this.getEyePosInto(_eye, 1), dir = this.getLookDirInto(_dir);
     var hit = world.raycast(eye, dir, this.reach, false);
     this.target = hit;
-    // entity target (mobs)
-    this.targetMob = MC.Mobs ? MC.Mobs.pick(eye, dir, hit ? hit.dist : 3.2) : null;
+    // Entity target. This used to fall back to 3.2 blocks when no block was hit, which
+    // silently shortened melee reach against mobs standing in the open.
+    this.targetMob = MC.Mobs ? MC.Mobs.pick(eye, dir, hit ? hit.dist : this.reach) : null;
     if (!this.controlsEnabled || !input.locked) { this.mining.progress = 0; this.mining.target = null; this.eating = 0; return; }
     var m = input.mouse; var left = (m.buttons & 1) !== 0, right = (m.buttons & 4) !== 0, middle = (m.buttons & 2) !== 0;
     var held = this.held();
     // hotbar selection
-    if (m.wheel) { this.selected = MC.mod(this.selected + m.wheel, 9); }
-    for (var k = 1; k <= 9; k++) if (input.pressed('Digit' + k)) this.selected = k - 1;
+    if (m.wheel) this.selected = MC.mod(this.selected + m.wheel, 9);
+    for (var k = 0; k < 9; k++) if (input.pressed(DIGITS[k])) this.selected = k;
     if (input.pressed('drop') && held) { var st = this.inventory.take(this.selected, input.down('ControlLeft') ? held.count : 1); this.game.dropItem(st); this.swingArm(); }
     if (input.pressed('swapHands')) { var t = this.inventory.slots[40]; this.inventory.slots[40] = this.inventory.slots[this.selected]; this.inventory.slots[this.selected] = t; }
     // attack mob
     if (left && this.targetMob && this.attackCooldown <= 0) {
       this.attackCooldown = 0.35; this.swingArm();
-      var dmg = 1; if (held && MC.ITEMS[held.id] && MC.ITEMS[held.id].tool) dmg = MC.ITEMS[held.id].tool.damage; else if (held && MC.ITEMS[held.id].block >= 0) dmg = 1;
+      var heldItem = held && MC.ITEMS[held.id];
+      var dmg = heldItem && heldItem.tool ? heldItem.tool.damage : 1;
       var crit = this.fallDist > 0 && !this.onGround && !this.inWater; if (crit) dmg *= 1.5;
       this.targetMob.hurt(dmg, 'player', this.pos, this.sprinting ? 0.9 : 0.5);
       MC.Audio.play(crit ? 'player.attack.sweep' : 'player.attack');
-      if (held && MC.ITEMS[held.id].tool) this.damageItem(this.selected, held.id === 'shears' ? 0 : 1);
+      if (heldItem && heldItem.tool) this.damageItem(this.selected, held.id === 'shears' ? 0 : 1);
       this.addExhaustion(0.1);
       this.mining.progress = 0; this.mining.target = null;
       return;
@@ -289,21 +328,18 @@
         if (this.mining.progress >= 1) { this.breakBlock(hit, held); this.mining.progress = 0; this.mining.target = null; this.mining.cooldown = 0.3; this.addExhaustion(0.005); }
       }
     } else if (!left) { this.mining.progress = 0; this.mining.target = null; }
-    else if (left && !hit) { if (!this.swinging && input.pressed('MouseLeft')) this.swingArm(); }
-    if (left && !hit) { var clicked = m.clicks.some(function (c) { return c.button === 0 && c.down; }); if (clicked) this.swingArm(); }
+    // swinging at thin air
+    if (left && !hit && input.clicked(0)) this.swingArm();
     // use / place
     if (right) {
-      var pressedNow = m.clicks.some(function (c) { return c.button === 2 && c.down; });
+      var pressedNow = input.clicked(2);
       if (pressedNow && this.targetMob && MC.Mobs.interact(this.targetMob, this, held)) { this.swingArm(); this.useCooldown = 0.25; return; }
       if (held && MC.ITEMS[held.id].food && (this.hunger < 20 || this.isCreative())) {
         this.eating += dt; if (Math.floor(this.eating * 5) !== Math.floor((this.eating - dt) * 5)) MC.Audio.play('player.eat', { volume: 0.5 });
         if (this.eating >= 1.6) { this.eat(held); if (!this.isCreative()) this.inventory.take(this.selected, 1); this.eating = 0; MC.Audio.play('player.burp'); }
-      } else if ((pressedNow || this.useCooldown <= 0) && hit) {
-        if (this.useCooldown <= 0 || pressedNow) { this.useOnBlock(hit, held); this.useCooldown = 0.25; }
-      } else if (pressedNow && held && MC.ITEMS[held.id].egg && !hit) { /* nothing */ }
-      else if (pressedNow && held && (held.id === 'water_bucket' || held.id === 'lava_bucket') && !hit) { }
+      } else if (hit && (pressedNow || this.useCooldown <= 0)) { this.useOnBlock(hit, held); this.useCooldown = 0.25; }
     } else this.eating = 0;
-    if (middle && this.isCreative() && hit) { var pressedMid = m.clicks.some(function (c) { return c.button === 1 && c.down; }); if (pressedMid) this.pickBlock(hit); }
+    if (middle && this.isCreative() && hit && input.clicked(1)) this.pickBlock(hit);
   };
   Player.prototype.swingArm = function () { this.swing = 0; this.swinging = true; };
   Player.prototype.breakTime = function (B, held) {
@@ -312,10 +348,10 @@
     if (B.tool && B.tool !== 'shears' && B.tool !== 'hoe') { if (tool && tool.type === B.tool) mult = tool.speed; if (B.tier > 0 && (!tool || tool.type !== B.tool || tool.tier < B.tier)) canHarvest = false; }
     else if (B.tool === 'shears' && tool && (tool.type === 'shears' || tool.type === 'sword')) mult = tool.type === 'shears' ? 15 : 1.5;
     else if (B.tool === 'hoe' && tool && tool.type === 'hoe') mult = tool.speed;
-    if (tool && tool.type === 'sword' && (B.name === 'cobweb')) mult = 15;
+    if (tool && tool.type === 'sword' && B.name === 'cobweb') mult = 15;
     var dmg = mult / Math.max(0.01, B.hardness) / (canHarvest ? 30 : 100);
     if (this.headInWater) dmg /= 5; if (!this.onGround) dmg /= 5;
-    var ticks = Math.ceil(1 / dmg); return Math.max(0.05, ticks / 20);
+    return Math.max(0.05, Math.ceil(1 / dmg) / 20);
   };
   Player.prototype.canHarvest = function (B, held) {
     var tool = held && MC.ITEMS[held.id] && MC.ITEMS[held.id].tool ? MC.ITEMS[held.id].tool : null;
@@ -326,13 +362,13 @@
     var world = this.world; var B = MC.BLOCKS[hit.id]; if (B.hardness < 0 && !this.isCreative()) return;
     var meta = world.getMeta(hit.x, hit.y, hit.z);
     world.setBlock(hit.x, hit.y, hit.z, 0, 0);
-    MC.Audio.play('dig.' + (B.sound === 'none' ? 'stone' : B.sound), { pos: new THREE.Vector3(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5) });
+    MC.Audio.play('dig.' + (B.sound === 'none' ? 'stone' : B.sound), { pos: _tmp.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5) });
     MC.Particles.blockBreak(hit.x, hit.y, hit.z, hit.id);
     if (!this.isCreative()) {
       var drops = this.game.dropsFor(hit.id, held, this.canHarvest(B, held));
       for (var i = 0; i < drops.length; i++) this.game.spawnDrop(drops[i], new THREE.Vector3(hit.x + 0.5, hit.y + 0.3, hit.z + 0.5));
       if (held && MC.ITEMS[held.id].tool && B.hardness > 0) this.damageItem(this.selected, 1);
-      var xp = { coal_ore: 1, diamond_ore: 5, emerald_ore: 5, lapis_ore: 3, redstone_ore: 3, copper_ore: 0, gold_ore: 0, iron_ore: 0 }[B.name]; if (xp) this.game.spawnXP(new THREE.Vector3(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5), xp);
+      var xp = ORE_XP[B.name]; if (xp) this.game.spawnXP(new THREE.Vector3(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5), xp);
     }
     this.game.onBlockBroken(hit.x, hit.y, hit.z, hit.id, meta);
   };
@@ -353,17 +389,17 @@
     }
     if (!held) return;
     var it = MC.ITEMS[held.id]; if (!it) return;
-    if (it.egg) { var p = new THREE.Vector3(hit.x + 0.5 + hit.face[0], hit.y + hit.face[1] * 1.0, hit.z + 0.5 + hit.face[2]); if (hit.face[1] > 0) p.y = hit.y + 1; this.game.spawnMob(it.egg, p); if (!this.isCreative()) this.inventory.take(this.selected, 1); this.swingArm(); return; }
+    if (it.egg) { var p = new THREE.Vector3(hit.x + 0.5 + hit.face[0], hit.y + hit.face[1], hit.z + 0.5 + hit.face[2]); if (hit.face[1] > 0) p.y = hit.y + 1; this.game.spawnMob(it.egg, p); if (!this.isCreative()) this.inventory.take(this.selected, 1); this.swingArm(); return; }
     if (held.id === 'bucket') {
-      var fl = world.raycast(this.getEyePos(1), this.getLookDir(), this.reach, true);
+      var fl = world.raycast(this.getEyePosInto(_eye2, 1), this.getLookDirInto(_dir2), this.reach, true);
       if (fl && (fl.id === MC.BLOCK.water.id || fl.id === MC.BLOCK.lava.id)) { world.setBlock(fl.x, fl.y, fl.z, 0, 0); if (!this.isCreative()) { this.inventory.take(this.selected, 1); this.inventory.add(fl.id === MC.BLOCK.water.id ? 'water_bucket' : 'lava_bucket', 1); } MC.Audio.play('player.splash', { volume: 0.5 }); this.swingArm(); }
       return;
     }
     if (it.place) { var px = hit.x + hit.face[0], py = hit.y + hit.face[1], pz = hit.z + hit.face[2]; var cur = world.getBlock(px, py, pz); if (cur === 0 || MC.BLOCKS[cur].replaceable) { world.setBlock(px, py, pz, MC.BLOCK[it.place].id, 0); if (!this.isCreative()) { this.inventory.take(this.selected, 1); this.inventory.add('bucket', 1); } MC.Audio.play('player.splash', { volume: 0.5 }); this.swingArm(); } return; }
     if (held.id === 'flint_and_steel') { MC.Audio.play('fire.ignite'); this.damageItem(this.selected, 1); this.swingArm(); return; }
-    if (held.id === 'bone_meal' && (B.name === 'grass_block')) { this.game.boneMeal(hit); if (!this.isCreative()) this.inventory.take(this.selected, 1); this.swingArm(); return; }
+    if (held.id === 'bone_meal' && B.name === 'grass_block') { this.game.boneMeal(hit); if (!this.isCreative()) this.inventory.take(this.selected, 1); this.swingArm(); return; }
     if (it.tool && it.tool.type === 'shovel' && B.name === 'grass_block' && hit.face[1] > 0) { world.setBlock(hit.x, hit.y, hit.z, MC.BLOCK.dirt_path.id, 0); MC.Audio.play('dig.grass', { pos: hit.point }); this.damageItem(this.selected, 1); this.swingArm(); return; }
-    if (it.tool && it.tool.type === 'axe' && (/_log$/).test(B.name)) { return; }
+    if (it.tool && it.tool.type === 'axe' && (/_log$/).test(B.name)) return;
     if (it.block < 0) return;
     // place block
     var PB = MC.BLOCKS[it.block];
@@ -375,15 +411,31 @@
     if (PB.solid && this.intersectsBlock(px2, py2, pz2)) return;
     if (MC.Mobs && PB.solid && MC.Mobs.anyIntersects(px2, py2, pz2)) return;
     var meta = 0;
-    if (PB.model === 'torch' || PB.model === 'cross' || PB.model === 'petals' || PB.model === 'layer') {
-      // needs support
-      if (PB.model === 'torch') { if (hit.face[1] < 0) return; if (hit.face[1] === 0) { meta = hit.face[0] === 1 ? 1 : hit.face[0] === -1 ? 2 : hit.face[2] === 1 ? 3 : 4; var supp = world.getBlock(px2 - hit.face[0], py2, pz2 - hit.face[2]); if (supp <= 0 || !MC.BLOCKS[supp].opaque) return; } else { var below = world.getBlock(px2, py2 - 1, pz2); if (below <= 0 || !MC.BLOCKS[below].solid) return; } }
-      else { var below2 = world.getBlock(px2, py2 - 1, pz2); if (below2 <= 0 || !MC.BLOCKS[below2].solid) return; if (PB.model === 'cross' && !B.replaceable && (PB.name.indexOf('sapling') >= 0 || PB.tint === 'grass' || (/tulip|dandelion|poppy|orchid|allium|bluet|daisy|cornflower|lily/).test(PB.name)) && !(MC.BLOCKS[below2].name === 'grass_block' || MC.BLOCKS[below2].name === 'dirt' || MC.BLOCKS[below2].name === 'podzol' || MC.BLOCKS[below2].name === 'coarse_dirt' || MC.BLOCKS[below2].name === 'moss_block')) return; if (PB.name === 'cactus' && !(MC.BLOCKS[below2].name === 'sand' || MC.BLOCKS[below2].name === 'red_sand' || MC.BLOCKS[below2].name === 'cactus')) return; if (PB.name === 'dead_bush' && !(MC.BLOCKS[below2].name === 'sand' || MC.BLOCKS[below2].name === 'red_sand' || MC.BLOCKS[below2].name === 'dirt' || MC.BLOCKS[below2].name === 'coarse_dirt' || MC.BLOCKS[below2].name === 'terracotta')) return; }
+    if (PB.model === 'torch') {
+      if (hit.face[1] < 0) return;
+      if (hit.face[1] === 0) {
+        meta = hit.face[0] === 1 ? 1 : hit.face[0] === -1 ? 2 : hit.face[2] === 1 ? 3 : 4;
+        var supp = world.getBlock(px2 - hit.face[0], py2, pz2 - hit.face[2]);
+        if (supp <= 0 || !MC.BLOCKS[supp].opaque) return;
+      } else {
+        var below = world.getBlock(px2, py2 - 1, pz2);
+        if (below <= 0 || !MC.BLOCKS[below].solid) return;
+      }
+    } else if (PB.model === 'cross' || PB.model === 'petals' || PB.model === 'layer') {
+      var below2 = world.getBlock(px2, py2 - 1, pz2);
+      if (below2 <= 0 || !MC.BLOCKS[below2].solid) return;
+      var soil = MC.BLOCKS[below2].name;
+      if (PB.model === 'cross' && !B.replaceable) {
+        if ((PB.name.indexOf('sapling') >= 0 || PB.tint === 'grass' || FLOWER_RE.test(PB.name)) && !PLANT_SOIL[soil]) return;
+        if (PB.name === 'cactus' && !CACTUS_SOIL[soil]) return;
+        if (PB.name === 'dead_bush' && !BUSH_SOIL[soil]) return;
+      }
     }
     if (PB.hasMeta && (/_log$/).test(PB.name)) meta = hit.face[1] !== 0 ? 0 : (hit.face[0] !== 0 ? 1 : 2);
-    if (PB.hasMeta && (PB.name === 'furnace' || PB.name === 'crafting_table' || PB.name === 'jack_o_lantern' || PB.name === 'carved_pumpkin' || PB.name === 'chest')) { var yaw = MC.mod(this.yaw, Math.PI * 2); var q = Math.round(yaw / (Math.PI / 2)) % 4; meta = [0, 1, 2, 3][q]; /* 0:+z(south) faces player looking north */ meta = q === 0 ? 0 : q === 1 ? 1 : q === 2 ? 2 : 3; }
+    // facing: 0 = +z (south), 1 = -x, 2 = -z, 3 = +x
+    if (PB.hasMeta && DIRECTIONAL[PB.name]) meta = Math.round(MC.mod(this.yaw, Math.PI * 2) / (Math.PI / 2)) % 4;
     world.setBlock(px2, py2, pz2, PB.id, meta);
-    MC.Audio.play('dig.' + (PB.sound === 'none' ? 'stone' : PB.sound), { pos: new THREE.Vector3(px2 + 0.5, py2 + 0.5, pz2 + 0.5), volume: 0.8, pitch: 0.8 });
+    MC.Audio.play('dig.' + (PB.sound === 'none' ? 'stone' : PB.sound), { pos: _tmp.set(px2 + 0.5, py2 + 0.5, pz2 + 0.5), volume: 0.8, pitch: 0.8 });
     if (!this.isCreative()) this.inventory.take(this.selected, 1);
     this.swingArm();
     this.game.onBlockPlaced(px2, py2, pz2, PB.id);
@@ -401,5 +453,9 @@
   Player.prototype.load = function (d) {
     if (!d) return; this.pos.set(d.pos[0], d.pos[1], d.pos[2]); this.prevPos.copy(this.pos); this.yaw = d.yaw || 0; this.pitch = d.pitch || 0; this.health = d.health; this.hunger = d.hunger; this.saturation = d.saturation; this.xp = d.xp || 0; this.level = d.level || 0; this.totalXp = d.totalXp || 0; this.inventory.load(d.inv); this.selected = d.selected || 0; this.setGameMode(d.gameMode || 'survival'); this.flying = !!d.flying; if (d.spawn) this.spawn.set(d.spawn[0], d.spawn[1], d.spawn[2]); this.score = d.score || 0;
   };
-  MC.Player = Player; MC.Inventory = Inventory;
+  MC.Player = Player;
+  // NOTE: js/ui/inventory.js also hangs its screens off MC.Inventory. PlayerInventory is
+  // the unambiguous name for the container class; MC.Inventory stays as an alias.
+  MC.PlayerInventory = Inventory;
+  MC.Inventory = Inventory;
 })();
