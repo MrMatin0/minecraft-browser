@@ -1,5 +1,18 @@
 // Sky: gradient dome with sunrise/sunset band, sun & moon, stars, drifting 3D clouds, day/night colors.
 (function () {
+  // Constant palette (never mutated) + per-frame scratch. Sky.update() runs every frame,
+  // so allocating a handful of Color/Vector3 objects in it was pure GC churn.
+  var C_SKY_DEFAULT = new THREE.Color(0x78a7ff);
+  var C_FOG_BASE = new THREE.Color(0xc0d8ff);
+  var C_NIGHT = new THREE.Color(0x02030a);
+  var C_NIGHT_FOG = new THREE.Color(0x0a0e1a);
+  var C_SUNSET_LATE = new THREE.Color(0xff5030);
+  var _skyBase = new THREE.Color();
+  var _sunsetCol = new THREE.Color();
+  var _water = new THREE.Color();
+  var _cloudCol = new THREE.Color();
+  var _sunDir = new THREE.Vector3();
+
   function Sky(scene, sharedUniforms) {
     this.scene = scene; this.shared = sharedUniforms;
     this.group = new THREE.Group(); scene.add(this.group);
@@ -34,6 +47,7 @@
     sun.position.set(0, 400, 0); sun.rotation.x = -Math.PI / 2; sun.renderOrder = -90; this.celestial.add(sun); this.sun = sun;
     var moon = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshBasicMaterial({ map: moonTex, transparent: true, depthWrite: false, depthTest: true, fog: false }));
     moon.position.set(0, -400, 0); moon.rotation.x = Math.PI / 2; moon.renderOrder = -90; this.celestial.add(moon); this.moon = moon;
+    this.celestial.rotation.order = 'XYZ';
   };
   Sky.prototype.buildStars = function () {
     var n = 1200, pos = new Float32Array(n * 3); var r = MC.rng(10842);
@@ -43,7 +57,7 @@
     this.stars.renderOrder = -95; this.celestial.add(this.stars);
   };
   Sky.prototype.buildClouds = function () {
-    var N = 96, CELL = 12, TH = 4; var r = MC.rng(777); var nz = new MC.Noise(4242);
+    var N = 96, CELL = 12, TH = 4; var nz = new MC.Noise(4242);
     var cells = new Uint8Array(N * N);
     for (var i = 0; i < N; i++) for (var j = 0; j < N; j++) {
       // periodic noise via 4D-ish trick: sample on a torus using two 2D noises
@@ -86,50 +100,47 @@
     var ang = this.celestialAngle();
     this.celestial.scale.setScalar(((far || 456) - 8) / 600);
     var rot = ang * Math.PI * 2;
-    // sun at +x at sunrise, up at noon
-    this.celestial.rotation.set(0, 0, 0); this.celestial.rotation.z = -rot; // rotate around z: sun from +x horizon up to +y
-    // rotate group so that the sun position is (cos, sin) in the x-y plane
-    this.sun.position.set(0, 400, 0); this.moon.position.set(0, -400, 0);
-    var sunDir = new THREE.Vector3(Math.sin(rot) * 1, Math.cos(rot), 0);
-    // day light: MC formula
-    var dl = 1 - (Math.cos(rot) * 2 + 0.2); dl = MC.clamp(dl, 0, 1); var dayLight = 1 - dl; // 1 at noon, 0 at night
-    // brightness with dusk shaping
+    // sun rises at +x and sweeps up to +y; sun/moon local positions are fixed at build time
+    this.celestial.rotation.z = -rot;
+    _sunDir.set(Math.sin(rot), Math.cos(rot), 0);
     var sunH = Math.cos(rot);
     var bright = MC.clamp((sunH + 0.15) / 0.55, 0, 1);
     this.dayLight = 0.2 + 0.8 * bright;
     var nightBlue = 1 - bright;
     // colors
-    var skyBase = biome ? new THREE.Color(biome.sky[0] / 255, biome.sky[1] / 255, biome.sky[2] / 255) : new THREE.Color(0x78a7ff);
-    var fogBase = new THREE.Color(0xc0d8ff);
+    if (biome) _skyBase.setRGB(biome.sky[0] / 255, biome.sky[1] / 255, biome.sky[2] / 255); else _skyBase.copy(C_SKY_DEFAULT);
     var dayF = MC.clamp((sunH + 0.1) / 0.45, 0, 1);
-    var night = new THREE.Color(0x02030a), nightFog = new THREE.Color(0x0a0e1a);
-    this.skyColor.copy(night).lerp(skyBase, Math.pow(dayF, 0.8));
-    this.fogColor.copy(nightFog).lerp(fogBase, Math.pow(dayF, 0.9));
+    this.skyColor.copy(C_NIGHT).lerp(_skyBase, Math.pow(dayF, 0.8));
+    this.fogColor.copy(C_NIGHT_FOG).lerp(C_FOG_BASE, Math.pow(dayF, 0.9));
     // sunset tint
     var sunset = MC.clamp(1 - Math.abs(sunH) / 0.3, 0, 1) * (sunH > -0.25 ? 1 : 0);
-    var sunsetCol = new THREE.Color(0xff8a2a).lerp(new THREE.Color(0xff5030), MC.clamp(-sunH * 6, 0, 1));
-    this.fogColor.lerp(sunsetCol, sunset * 0.35);
+    _sunsetCol.setHex(0xff8a2a).lerp(C_SUNSET_LATE, MC.clamp(-sunH * 6, 0, 1));
+    this.fogColor.lerp(_sunsetCol, sunset * 0.35);
     var mat = this.dome.material.uniforms;
-    mat.uZenith.value.copy(this.skyColor); mat.uHorizon.value.copy(this.fogColor); mat.uSunDir.value.copy(sunDir); mat.uSunset.value = sunset; mat.uSunsetColor.value.copy(sunsetCol);
+    mat.uZenith.value.copy(this.skyColor); mat.uHorizon.value.copy(this.fogColor); mat.uSunDir.value.copy(_sunDir); mat.uSunset.value = sunset; mat.uSunsetColor.value.copy(_sunsetCol);
     mat.uVoid.value.copy(this.fogColor).multiplyScalar(0.5);
-    if (underwater) { var wc = new THREE.Color(0x0a2a6a).multiplyScalar(this.dayLight); this.fogColor.copy(wc); this.skyColor.copy(wc); mat.uZenith.value.copy(wc); mat.uHorizon.value.copy(wc); mat.uVoid.value.copy(wc); mat.uSunset.value = 0; }
+    if (underwater) {
+      _water.setHex(0x0a2a6a).multiplyScalar(this.dayLight);
+      this.fogColor.copy(_water); this.skyColor.copy(_water);
+      mat.uZenith.value.copy(_water); mat.uHorizon.value.copy(_water); mat.uVoid.value.copy(_water); mat.uSunset.value = 0;
+    }
     this.stars.material.opacity = MC.clamp((0.2 - sunH) / 0.35, 0, 1) * 0.9;
-    this.sun.material.opacity = 1; this.moon.material.opacity = MC.clamp((0.1 - sunH) / 0.2, 0, 1) * 0.95 + 0.05;
+    this.moon.material.opacity = MC.clamp((0.1 - sunH) / 0.2, 0, 1) * 0.95 + 0.05;
     this.group.position.copy(camPos);
     // clouds drift + wrap
     this.cloudDrift += dt * 0.6;
     if (this.clouds) {
       var P = this.cloudPeriod; var x = this.cloudDrift; var wrapX = Math.round((camPos.x - x) / P) * P;
       this.clouds.position.set(x + wrapX - camPos.x, 136 - camPos.y, Math.round(camPos.z / P) * P - camPos.z);
-      var cc = new THREE.Color(1, 1, 1).multiplyScalar(0.35 + 0.65 * bright); cc.lerp(sunsetCol, sunset * 0.35);
-      this.clouds.material.uniforms.uColor.value.copy(cc);
+      _cloudCol.setRGB(1, 1, 1).multiplyScalar(0.35 + 0.65 * bright).lerp(_sunsetCol, sunset * 0.35);
+      this.clouds.material.uniforms.uColor.value.copy(_cloudCol);
       this.clouds.visible = this.cloudsEnabled && !underwater;
     }
     // shared lighting uniforms
     this.shared.uSkyLight.value = this.dayLight;
-    var tint = this.shared.uSkyTint.value; tint.set(1 - nightBlue * 0.25, 1 - nightBlue * 0.2, 1);
+    this.shared.uSkyTint.value.set(1 - nightBlue * 0.25, 1 - nightBlue * 0.2, 1);
     this.shared.uFogColor.value.set(this.fogColor.r, this.fogColor.g, this.fogColor.b);
   };
-  Sky.prototype.isNight = function () { var rot = this.celestialAngle() * Math.PI * 2; return Math.cos(rot) < -0.05; };
+  Sky.prototype.isNight = function () { return Math.cos(this.celestialAngle() * Math.PI * 2) < -0.05; };
   MC.Sky = Sky;
 })();
