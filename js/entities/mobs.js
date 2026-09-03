@@ -3,18 +3,26 @@
   var TYPES = {};
   var list = [];
   var ctx = { world: null, scene: null, ents: null, shared: null, sky: null, game: null, player: null };
-  var skins = {}, materials = {};
+  // Caches keyed by mob type. Skins and part geometry are identical for every instance of a
+  // type, so they are built once and shared -- previously each spawned mob uploaded its own
+  // copy of the skin texture and built its own box geometries, and nothing was ever freed.
+  var skins = {}, skinTextures = {}, partGeoCache = {};
+  // Scratch vectors for the per-frame AI paths.
+  var _eye = new THREE.Vector3(), _to = new THREE.Vector3(), _away = new THREE.Vector3(), _drop = new THREE.Vector3();
+  var HEAD_ACCESSORIES = ['snout', 'headWool', 'beak', 'wattle', 'hornR', 'hornL'];
+  var WOOL_PARTS = ['headWool', 'bodyWool', 'legW1', 'legW2', 'legW3', 'legW4'];
+  var PASSIVE_TYPES = ['pig', 'cow', 'sheep', 'chicken'];
 
   // ---------- skin painting helpers ----------
   function cv(w, h) { var c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
   function rnd(seedStr) { return MC.rng(MC.hashStr(seedStr)); }
-  // paint a box's 6 faces in MC layout; colors: fn(face, x, y, w, h) -> css or css string
+  // paint a box's 6 faces in MC layout; colors: fn(face) -> css, or a css string
   function paintBox(g, u, v, w, h, d, color, noiseAmt, r) {
     var faces = { top: [u + d, v, w, d], bottom: [u + d + w, v, w, d], right: [u, v + d, d, h], front: [u + d, v + d, w, h], left: [u + d + w, v + d, d, h], back: [u + 2 * d + w, v + d, w, h] };
     Object.keys(faces).forEach(function (f) {
       var rr = faces[f]; var base = typeof color === 'function' ? color(f) : color;
       for (var y = 0; y < rr[3]; y++) for (var x = 0; x < rr[2]; x++) {
-        var c = base; if (noiseAmt) { var k = 1 + (r() - 0.5) * noiseAmt; c = shade(base, k); }
+        var c = base; if (noiseAmt) c = shade(base, 1 + (r() - 0.5) * noiseAmt);
         g.fillStyle = c; g.fillRect(rr[0] + x, rr[1] + y, 1, 1);
       }
     });
@@ -45,22 +53,29 @@
     var s = def.size, inflate = def.inflate || 0;
     var geo = new THREE.BoxGeometry((s[0] + inflate * 2) / 16, (s[1] + inflate * 2) / 16, (s[2] + inflate * 2) / 16);
     boxUV(geo, tex.width, tex.height, def.uv[0], def.uv[1], s[0], s[1], s[2], def.mirror);
-    var sh = new Float32Array(24 * 3); for (var f = 0; f < 6; f++) for (var k = 0; k < 4; k++) { sh[(f * 4 + k) * 3] = SHADES[f]; }
+    var sh = new Float32Array(24 * 3); for (var f = 0; f < 6; f++) for (var k = 0; k < 4; k++) sh[(f * 4 + k) * 3] = SHADES[f];
     geo.setAttribute('aShade', new THREE.BufferAttribute(sh, 3));
     return geo;
   }
+  // Cached per type + part name; identical for every instance so there is no reason to
+  // rebuild these every time a mob spawns.
+  function partGeometry(type, def, tex) {
+    var byType = partGeoCache[type] || (partGeoCache[type] = {});
+    return byType[def.name] || (byType[def.name] = makePart(def, tex));
+  }
   function buildModel(type, mat) {
-    var T = TYPES[type]; var tex = skins[type];
+    var T = TYPES[type]; var tex = skinFor(type);
     var root = new THREE.Group(); var parts = {};
-    T.parts.forEach(function (def) {
+    for (var i = 0; i < T.parts.length; i++) {
+      var def = T.parts[i];
       var pivot = new THREE.Group(); var p = def.pivot || def.pos;
       pivot.position.set(p[0] / 16, p[1] / 16, p[2] / 16);
-      var mesh = new THREE.Mesh(makePart(def, tex), mat);
+      var mesh = new THREE.Mesh(partGeometry(type, def, tex), mat);
       mesh.position.set((def.pos[0] - p[0]) / 16, (def.pos[1] - p[1]) / 16, (def.pos[2] - p[2]) / 16);
       if (def.rot) mesh.rotation.set(def.rot[0], def.rot[1], def.rot[2]);
       pivot.add(mesh); root.add(pivot); parts[def.name] = pivot; pivot.userData.mesh = mesh;
       if (def.hidden) pivot.visible = false;
-    });
+    }
     return { root: root, parts: parts };
   }
 
@@ -153,8 +168,8 @@
       { name: 'leg3', size: [4, 6, 4], pos: [-2, 3, 4], pivot: [-2, 6, 4], uv: [0, 16] }, { name: 'leg4', size: [4, 6, 4], pos: [2, 3, 4], pivot: [2, 6, 4], uv: [0, 16] }
     ],
     skin: function (g, r) {
-      function camo(f) { return 'rgb(' + (40 + r.int(60)) + ',' + (140 + r.int(80)) + ',' + (40 + r.int(50)) + ')'; }
-      var faces = paintBox(g, 0, 0, 8, 8, 8, camo, 0.5, r); paintBox(g, 16, 16, 8, 12, 4, camo, 0.5, r); paintBox(g, 0, 16, 4, 6, 4, camo, 0.5, r);
+      function camo() { return 'rgb(' + (40 + r.int(60)) + ',' + (140 + r.int(80)) + ',' + (40 + r.int(50)) + ')'; }
+      paintBox(g, 0, 0, 8, 8, 8, camo, 0.5, r); paintBox(g, 16, 16, 8, 12, 4, camo, 0.5, r); paintBox(g, 0, 16, 4, 6, 4, camo, 0.5, r);
       var K = '#0a0a0a'; rect(g, 9, 11, 2, 2, K); rect(g, 13, 11, 2, 2, K); rect(g, 11, 13, 2, 3, K); rect(g, 10, 14, 1, 2, K); rect(g, 13, 14, 1, 2, K);
     }
   });
@@ -178,10 +193,18 @@
     var T = TYPES[type]; var size = T.texSize || [64, 32]; var c = cv(size[0], size[1]); var g = c.getContext('2d');
     T.skin(g, rnd(type)); skins[type] = c; return c;
   }
-  function materialFor(type) {
-    var tex = new THREE.CanvasTexture(skinFor(type)); tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter; tex.colorSpace = THREE.SRGBColorSpace;
-    return MC.Shaders.createEntityMaterial(tex, ctx.shared);
+  // One GPU texture per mob type, not per mob instance.
+  function skinTexture(type) {
+    var tex = skinTextures[type];
+    if (!tex) {
+      tex = new THREE.CanvasTexture(skinFor(type));
+      tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter; tex.colorSpace = THREE.SRGBColorSpace;
+      skinTextures[type] = tex;
+    }
+    return tex;
   }
+  // The material stays per-mob because it carries uLight / uHurt / uTint.
+  function materialFor(type) { return MC.Shaders.createEntityMaterial(skinTexture(type), ctx.shared); }
 
   // ---------- Mob ----------
   function Mob(type, pos) {
@@ -189,13 +212,18 @@
     this.pos = pos.clone(); this.vel = new THREE.Vector3(); this.width = T.width; this.height = T.height;
     this.health = T.health; this.maxHealth = T.health; this.dead = false; this.dying = 0; this.age = 0;
     this.yaw = Math.random() * Math.PI * 2; this.bodyYaw = this.yaw; this.headYaw = this.yaw; this.headPitch = 0;
+    this.headYawTarget = this.yaw; this.headPitchTarget = 0; this.lookAtPlayer = 0;
     this.limb = 0; this.limbAmt = 0; this.hurtT = 0; this.onGround = false; this.state = 'idle'; this.stateT = Math.random() * 3;
-    this.target = null; this.panic = 0; this.attackCd = 0; this.fuse = 0; this.fire = 0; this.sheared = false; this.woolTimer = 0; this.soundT = 3 + Math.random() * 8; this.angry = false; this.jumpCd = 0;
+    this.target = null; this.wander = new THREE.Vector3();
+    this.panic = 0; this.attackCd = 0; this.fuse = 0; this.fire = 0; this.lavaT = 0; this.sheared = false; this.woolTimer = 0; this.soundT = 3 + Math.random() * 8; this.angry = false; this.jumpCd = 0;
+    this.boxes = []; // persistent collision scratch
     this.material = materialFor(type); var m = buildModel(type, this.material); this.group = m.root; this.parts = m.parts;
     if (T.armsOut) { this.parts.armR.rotation.x = -Math.PI / 2; this.parts.armL.rotation.x = -Math.PI / 2; }
     this.mesh = this.group; this.persistent = false;
   }
-  Mob.prototype.setLight = function (b) { this.material.uniforms.uLight.value = b; };
+  // Skins and part geometry are shared per type, so only the material belongs to this mob.
+  Mob.prototype.dispose = function () { if (this.material) { this.material.dispose(); this.material = null; } };
+  Mob.prototype.setLight = function (b) { if (this.material) this.material.uniforms.uLight.value = b; };
   Mob.prototype.hurt = function (amount, source, from, knock) {
     if (this.dead || this.dying) return false;
     this.health -= amount; this.hurtT = 0.5; this.material.uniforms.uHurt.value = 1;
@@ -208,10 +236,11 @@
   };
   Mob.prototype.die = function (source) {
     this.dying = 0.001; this.health = 0;
+    _drop.set(this.pos.x, this.pos.y + this.height / 2, this.pos.z);
     var r = MC.rng((Math.random() * 1e9) | 0);
     var drops = this.T.drops(r, this.fire > 0, this);
-    for (var i = 0; i < drops.length; i++) if (drops[i].count > 0) ctx.game.spawnDrop({ id: drops[i].id, count: drops[i].count, damage: 0 }, this.pos.clone().add(new THREE.Vector3(0, this.height / 2, 0)));
-    if (source === 'player') ctx.game.spawnXP(this.pos.clone().add(new THREE.Vector3(0, this.height / 2, 0)), this.T.xp + (Math.random() < 0.5 ? 1 : 0));
+    for (var i = 0; i < drops.length; i++) if (drops[i].count > 0) ctx.game.spawnDrop({ id: drops[i].id, count: drops[i].count, damage: 0 }, _drop);
+    if (source === 'player') ctx.game.spawnXP(_drop, this.T.xp + (Math.random() < 0.5 ? 1 : 0));
   };
   Mob.prototype.moveToward = function (tx, tz, speed, dt) {
     var dx = tx - this.pos.x, dz = tz - this.pos.z; var d = Math.sqrt(dx * dx + dz * dz); if (d < 0.05) return;
@@ -225,7 +254,13 @@
       if (b1 > 0 && MC.BLOCKS[b1].solid && !(b2 > 0 && MC.BLOCKS[b2].solid)) { this.vel.y = 8.2; this.jumpCd = 0.6; }
     }
   };
-  Mob.prototype.canSee = function (p) { var eye = this.pos.clone().add(new THREE.Vector3(0, this.height * 0.85, 0)); var to = p.getEyePos(1).sub(eye); var d = to.length(); if (d > 24) return false; var hit = ctx.world.raycast(eye, to.normalize(), d, false); return !hit; };
+  Mob.prototype.canSee = function (p) {
+    _eye.set(this.pos.x, this.pos.y + this.height * 0.85, this.pos.z);
+    _to.set(p.pos.x - _eye.x, p.pos.y + p.eyeHeight - _eye.y, p.pos.z - _eye.z);
+    var d = _to.length(); if (d > 24 || d < 1e-6) return d <= 24;
+    _to.divideScalar(d);
+    return !ctx.world.raycast(_eye, _to, d, false);
+  };
   Mob.prototype.update = function (dt) {
     var T = this.T, world = ctx.world, player = ctx.player;
     this.age += dt; if (this.jumpCd > 0) this.jumpCd -= dt;
@@ -234,23 +269,41 @@
     // environment
     var inWater = ctx.ents.inWater(this.pos.x, this.pos.y + 0.3, this.pos.z);
     var feetId = world.getBlock(Math.floor(this.pos.x), Math.floor(this.pos.y + 0.1), Math.floor(this.pos.z));
-    if (feetId === MC.BLOCK.lava.id) { this.fire = 4; if (this.age % 0.5 < dt) this.hurt(4, 'lava'); }
+    // Real timer: `this.age % 0.5 < dt` fired erratically depending on frame pacing.
+    if (feetId === MC.BLOCK.lava.id) { this.fire = 4; this.lavaT += dt; if (this.lavaT >= 0.5) { this.lavaT = 0; this.hurt(4, 'lava'); } }
+    else this.lavaT = 0;
     // burning in daylight
-    if (T.burns && !ctx.sky.isNight() && ctx.sky.dayLight > 0.6) { var l = world.getLight(Math.floor(this.pos.x), Math.floor(this.pos.y + this.height), Math.floor(this.pos.z)); if (l.sky >= 15 && !inWater) this.fire = Math.max(this.fire, 1); }
-    if (this.fire > 0) { this.fire -= dt; if (Math.floor(this.age * 2) !== Math.floor((this.age - dt) * 2)) this.hurt(1, 'fire'); if (Math.random() < dt * 20) MC.Particles.flame(this.pos.x + (Math.random() - 0.5) * this.width, this.pos.y + Math.random() * this.height, this.pos.z + (Math.random() - 0.5) * this.width); if (inWater) this.fire = 0; }
+    if (T.burns && !ctx.sky.isNight() && ctx.sky.dayLight > 0.6 && !inWater) {
+      if ((world.getLightPacked(Math.floor(this.pos.x), Math.floor(this.pos.y + this.height), Math.floor(this.pos.z)) >> 4) >= 15) this.fire = Math.max(this.fire, 1);
+    }
+    if (this.fire > 0) {
+      this.fire -= dt;
+      if (Math.floor(this.age * 2) !== Math.floor((this.age - dt) * 2)) this.hurt(1, 'fire');
+      if (Math.random() < dt * 20) MC.Particles.flame(this.pos.x + (Math.random() - 0.5) * this.width, this.pos.y + Math.random() * this.height, this.pos.z + (Math.random() - 0.5) * this.width);
+      if (inWater) this.fire = 0;
+    }
     var dist = player && !player.dead ? player.pos.distanceTo(this.pos) : 999;
     var speed = T.speed;
     // AI
     this.stateT -= dt;
-    if (this.panic > 0) { this.panic -= dt; if (this.stateT <= 0 || !this.target) { var a = Math.random() * Math.PI * 2; this.target = new THREE.Vector3(this.pos.x + Math.cos(a) * 6, 0, this.pos.z + Math.sin(a) * 6); this.stateT = 1.5; } this.moveToward(this.target.x, this.target.z, speed * 1.6, dt); if (this.panic <= 0) { this.state = 'idle'; this.target = null; } }
-    else if (T.hostile && (!T.nightOnly || this.angry || ctx.sky.isNight() || world.getLight(Math.floor(this.pos.x), Math.floor(this.pos.y), Math.floor(this.pos.z)).sky < 10) && player && !player.dead && !player.isCreative() && dist < 16 && (this.state === 'chase' || this.canSee(player))) {
+    var nightish = !T.nightOnly || this.angry || ctx.sky.isNight() || (world.getLightPacked(Math.floor(this.pos.x), Math.floor(this.pos.y), Math.floor(this.pos.z)) >> 4) < 10;
+    if (this.panic > 0) {
+      this.panic -= dt;
+      if (this.stateT <= 0 || !this.target) { var a = Math.random() * Math.PI * 2; this.target = this.wander.set(this.pos.x + Math.cos(a) * 6, 0, this.pos.z + Math.sin(a) * 6); this.stateT = 1.5; }
+      this.moveToward(this.target.x, this.target.z, speed * 1.6, dt);
+      if (this.panic <= 0) { this.state = 'idle'; this.target = null; }
+    }
+    else if (T.hostile && nightish && player && !player.dead && !player.isCreative() && dist < 16 && (this.state === 'chase' || this.canSee(player))) {
       this.state = 'chase';
       if (T.ranged) {
-        if (dist > 9) this.moveToward(player.pos.x, player.pos.z, speed, dt); else if (dist < 5) { var away = this.pos.clone().sub(player.pos).normalize(); this.moveToward(this.pos.x + away.x * 4, this.pos.z + away.z * 4, speed * 0.8, dt); } else { this.vel.x *= 0.8; this.vel.z *= 0.8; var ddx = player.pos.x - this.pos.x, ddz = player.pos.z - this.pos.z; this.yaw = Math.atan2(-ddx, -ddz); }
-        this.attackCd -= dt; if (this.attackCd <= 0 && dist < 15 && this.canSee(player)) { this.attackCd = 2 + Math.random(); ctx.game.shootArrow(this, player); }
+        if (dist > 9) this.moveToward(player.pos.x, player.pos.z, speed, dt);
+        else if (dist < 5) { _away.set(this.pos.x - player.pos.x, 0, this.pos.z - player.pos.z).normalize(); this.moveToward(this.pos.x + _away.x * 4, this.pos.z + _away.z * 4, speed * 0.8, dt); }
+        else { this.vel.x *= 0.8; this.vel.z *= 0.8; this.yaw = Math.atan2(-(player.pos.x - this.pos.x), -(player.pos.z - this.pos.z)); }
+        this.attackCd -= dt;
+        if (this.attackCd <= 0 && dist < 15 && this.canSee(player)) { this.attackCd = 2 + Math.random(); ctx.game.shootArrow(this, player); }
       } else if (T.explodes) {
         if (dist > 3) { this.moveToward(player.pos.x, player.pos.z, speed, dt); this.fuse = Math.max(0, this.fuse - dt * 1.5); }
-        else { this.vel.x *= 0.7; this.vel.z *= 0.7; if (this.fuse === 0) MC.Audio.play('creeper.primed', { pos: this.pos }); this.fuse += dt; var ddx2 = player.pos.x - this.pos.x, ddz2 = player.pos.z - this.pos.z; this.yaw = Math.atan2(-ddx2, -ddz2); }
+        else { this.vel.x *= 0.7; this.vel.z *= 0.7; if (this.fuse === 0) MC.Audio.play('creeper.primed', { pos: this.pos }); this.fuse += dt; this.yaw = Math.atan2(-(player.pos.x - this.pos.x), -(player.pos.z - this.pos.z)); }
         if (dist > 7) this.fuse = Math.max(0, this.fuse - dt * 3);
         if (this.fuse >= 1.5) { this.dead = true; ctx.ents.explode(this.pos.x, this.pos.y + 0.5, this.pos.z, 3, player); return; }
       } else {
@@ -261,12 +314,32 @@
       }
     } else {
       if (this.state === 'chase') { this.state = 'idle'; this.stateT = 1; this.fuse = 0; }
-      if (this.state === 'idle') { this.vel.x *= Math.pow(0.05, dt); this.vel.z *= Math.pow(0.05, dt); if (this.stateT <= 0) { if (Math.random() < 0.6) { var a2 = Math.random() * Math.PI * 2, r2 = 3 + Math.random() * 7; this.target = new THREE.Vector3(this.pos.x + Math.cos(a2) * r2, 0, this.pos.z + Math.sin(a2) * r2); var ty = world.getTopSolid(Math.floor(this.target.x), Math.floor(this.target.z)); if (ty > 0 && Math.abs(ty + 1 - this.pos.y) < 4 && world.getBlock(Math.floor(this.target.x), ty, Math.floor(this.target.z)) !== MC.BLOCK.water.id) { this.state = 'walk'; this.stateT = 6; } else this.stateT = 1; } else this.stateT = 2 + Math.random() * 4; } }
-      else if (this.state === 'walk') { this.moveToward(this.target.x, this.target.z, speed * 0.6, dt); var d2 = Math.hypot(this.target.x - this.pos.x, this.target.z - this.pos.z); if (d2 < 0.8 || this.stateT <= 0) { this.state = 'idle'; this.stateT = 2 + Math.random() * 5; } }
+      if (this.state === 'idle') {
+        this.vel.x *= Math.pow(0.05, dt); this.vel.z *= Math.pow(0.05, dt);
+        if (this.stateT <= 0) {
+          if (Math.random() < 0.6) {
+            var a2 = Math.random() * Math.PI * 2, r2 = 3 + Math.random() * 7;
+            this.target = this.wander.set(this.pos.x + Math.cos(a2) * r2, 0, this.pos.z + Math.sin(a2) * r2);
+            var ty = world.getTopSolid(Math.floor(this.target.x), Math.floor(this.target.z));
+            if (ty > 0 && Math.abs(ty + 1 - this.pos.y) < 4 && world.getBlock(Math.floor(this.target.x), ty, Math.floor(this.target.z)) !== MC.BLOCK.water.id) { this.state = 'walk'; this.stateT = 6; }
+            else this.stateT = 1;
+          } else this.stateT = 2 + Math.random() * 4;
+        }
+      }
+      else if (this.state === 'walk') {
+        this.moveToward(this.target.x, this.target.z, speed * 0.6, dt);
+        var d2 = Math.hypot(this.target.x - this.pos.x, this.target.z - this.pos.z);
+        if (d2 < 0.8 || this.stateT <= 0) { this.state = 'idle'; this.stateT = 2 + Math.random() * 5; }
+      }
       // look at player when near
       if (dist < 6 && Math.random() < dt * 2) this.lookAtPlayer = 2 + Math.random() * 2;
     }
-    if (this.lookAtPlayer > 0) { this.lookAtPlayer -= dt; if (player) { var lx = player.pos.x - this.pos.x, lz = player.pos.z - this.pos.z; this.headYawTarget = Math.atan2(-lx, -lz); this.headPitchTarget = Math.atan2(player.pos.y + 1.4 - (this.pos.y + this.height * 0.9), Math.hypot(lx, lz)); } } else { this.headYawTarget = this.yaw; this.headPitchTarget = 0; }
+    if (this.lookAtPlayer > 0 && player) {
+      this.lookAtPlayer -= dt;
+      var lx = player.pos.x - this.pos.x, lz = player.pos.z - this.pos.z;
+      this.headYawTarget = Math.atan2(-lx, -lz);
+      this.headPitchTarget = Math.atan2(player.pos.y + 1.4 - (this.pos.y + this.height * 0.9), Math.hypot(lx, lz));
+    } else { this.headYawTarget = this.yaw; this.headPitchTarget = 0; }
     // ambient sounds
     this.soundT -= dt; if (this.soundT <= 0) { this.soundT = 6 + Math.random() * 14; if (dist < 24 && MC.Audio.SFX[T.sound + '.ambient']) MC.Audio.play(T.sound + '.ambient', { pos: this.pos, volume: 0.8 }); }
     // wool regrowth
@@ -277,15 +350,15 @@
     if (this.vel.y < -40) this.vel.y = -40;
     var wasGround = this.onGround, vyBefore = this.vel.y;
     ctx.ents.moveEntity(this, dt);
-    if (this.onGround && !wasGround && vyBefore < -12 && !inWater) { var fall = (vyBefore * vyBefore) / (2 * 32) - 3; if (fall > 0) this.hurt(Math.floor(fall), 'fall'); }
+    if (this.onGround && !wasGround && vyBefore < -12 && !inWater) { var fall = (vyBefore * vyBefore) / 64 - 3; if (fall > 0) this.hurt(Math.floor(fall), 'fall'); }
     // despawn far away
-    if (dist > (T.hostile ? 64 : 110)) { this.dead = true; }
+    if (dist > (T.hostile ? 64 : 110)) this.dead = true;
     // animation
     var hs = Math.hypot(this.vel.x, this.vel.z);
     this.limbAmt += (Math.min(1, hs / speed) - this.limbAmt) * Math.min(1, dt * 6); this.limb += hs * dt * 3.2;
     var dyaw = this.yaw - this.bodyYaw; dyaw = Math.atan2(Math.sin(dyaw), Math.cos(dyaw)); this.bodyYaw += dyaw * Math.min(1, dt * 8);
-    var hy = (this.headYawTarget !== undefined ? this.headYawTarget : this.yaw) - this.headYaw; hy = Math.atan2(Math.sin(hy), Math.cos(hy)); this.headYaw += hy * Math.min(1, dt * 6);
-    this.headPitch += ((this.headPitchTarget || 0) - this.headPitch) * Math.min(1, dt * 6);
+    var hy = this.headYawTarget - this.headYaw; hy = Math.atan2(Math.sin(hy), Math.cos(hy)); this.headYaw += hy * Math.min(1, dt * 6);
+    this.headPitch += (this.headPitchTarget - this.headPitch) * Math.min(1, dt * 6);
     this.updateModel();
   };
   Mob.prototype.updateModel = function () {
@@ -293,29 +366,40 @@
     g.position.set(this.pos.x, this.pos.y, this.pos.z); g.rotation.y = this.bodyYaw;
     var rel = this.headYaw - this.bodyYaw; rel = Math.atan2(Math.sin(rel), Math.cos(rel)); rel = MC.clamp(rel, -1.3, 1.3);
     if (P.head) { P.head.rotation.y = rel; P.head.rotation.x = -this.headPitch; }
-    ['snout', 'headWool', 'beak', 'wattle', 'hornR', 'hornL'].forEach(function (n) { if (P[n]) { P[n].rotation.y = rel; P[n].rotation.x = -(this.headPitch); } }, this);
+    // plain loop: this used to allocate an array literal and a closure per mob per frame
+    for (var ai = 0; ai < HEAD_ACCESSORIES.length; ai++) {
+      var part = P[HEAD_ACCESSORIES[ai]];
+      if (part) { part.rotation.y = rel; part.rotation.x = -this.headPitch; }
+    }
     var s = Math.sin(this.limb) * this.limbAmt * 1.2;
     if (P.leg1) { P.leg1.rotation.x = s; P.leg4.rotation.x = s; P.leg2.rotation.x = -s; P.leg3.rotation.x = -s; if (P.legW1) { P.legW1.rotation.x = s; P.legW4.rotation.x = s; P.legW2.rotation.x = -s; P.legW3.rotation.x = -s; } }
     if (P.legR) { P.legR.rotation.x = s; P.legL.rotation.x = -s; }
     if (P.armR && !T.armsOut) { P.armR.rotation.x = -s; P.armL.rotation.x = s; }
-    if (P.armR && T.armsOut) { P.armR.rotation.x = -Math.PI / 2 + Math.sin(this.age * 1.5) * 0.06; P.armL.rotation.x = -Math.PI / 2 - Math.sin(this.age * 1.5) * 0.06; P.armR.rotation.y = -0.1 + Math.sin(this.limb) * 0.05; P.armL.rotation.y = 0.1 - Math.sin(this.limb) * 0.05; }
+    if (P.armR && T.armsOut) { var sway = Math.sin(this.age * 1.5) * 0.06, lim = Math.sin(this.limb) * 0.05; P.armR.rotation.x = -Math.PI / 2 + sway; P.armL.rotation.x = -Math.PI / 2 - sway; P.armR.rotation.y = -0.1 + lim; P.armL.rotation.y = 0.1 - lim; }
     if (P.wingR) { var w = this.onGround ? 0 : Math.sin(this.age * 25) * 0.8; P.wingR.rotation.z = w; P.wingL.rotation.z = -w; }
     if (this.type === 'spider') { for (var i = 1; i <= 4; i++) { var ph = Math.sin(this.limb + i) * this.limbAmt * 0.4; P['legR' + i].rotation.y = 0.6 - (i - 1) * 0.4 + ph; P['legL' + i].rotation.y = -0.6 + (i - 1) * 0.4 - ph; } }
-    if (T.explodes) { var sw = 1 + Math.min(1, this.fuse / 1.5) * 0.3 * (0.5 + 0.5 * Math.sin(this.fuse * 40)); g.scale.set(sw, sw, sw); this.material.uniforms.uTint.value.setScalar(1 + Math.min(1, this.fuse / 1.5) * (Math.sin(this.fuse * 30) > 0 ? 1.2 : 0)); }
+    if (T.explodes) { var f = Math.min(1, this.fuse / 1.5); var sw = 1 + f * 0.3 * (0.5 + 0.5 * Math.sin(this.fuse * 40)); g.scale.set(sw, sw, sw); this.material.uniforms.uTint.value.setScalar(1 + f * (Math.sin(this.fuse * 30) > 0 ? 1.2 : 0)); }
   };
-  Mob.prototype.setSheared = function (v) { this.sheared = v; var P = this.parts; ['headWool', 'bodyWool', 'legW1', 'legW2', 'legW3', 'legW4'].forEach(function (n) { if (P[n]) P[n].visible = !v; }); if (v) this.woolTimer = 40 + Math.random() * 30; };
+  Mob.prototype.setSheared = function (v) {
+    this.sheared = v; var P = this.parts;
+    for (var i = 0; i < WOOL_PARTS.length; i++) { var part = P[WOOL_PARTS[i]]; if (part) part.visible = !v; }
+    if (v) this.woolTimer = 40 + Math.random() * 30;
+  };
   Mob.prototype.intersects = function (x, y, z) { var w = this.width / 2; return !(this.pos.x + w <= x || this.pos.x - w >= x + 1 || this.pos.z + w <= z || this.pos.z - w >= z + 1 || this.pos.y + this.height <= y || this.pos.y >= y + 1); };
 
   // ---------- manager ----------
   var Mobs = {
     list: list, TYPES: TYPES,
-    init: function (world, scene, ents, shared, sky, game) { ctx.world = world; ctx.scene = scene; ctx.ents = ents; ctx.shared = shared; ctx.sky = sky; ctx.game = game; list.length = 0; skins = {}; this.spawnTimer = 0; },
+    // Note: skins / skinTextures / partGeoCache are deliberately *not* cleared here. They are
+    // deterministic per type and shared, so keeping them avoids repainting and re-uploading
+    // every skin on each world load.
+    init: function (world, scene, ents, shared, sky, game) { ctx.world = world; ctx.scene = scene; ctx.ents = ents; ctx.shared = shared; ctx.sky = sky; ctx.game = game; this.clear(); this.spawnTimer = 0; },
     setPlayer: function (p) { ctx.player = p; },
     spawn: function (type, pos) { if (!TYPES[type]) return null; var m = new Mob(type, pos); list.push(m); ctx.scene.add(m.group); return m; },
     update: function (dt, dayLight) {
       for (var i = list.length - 1; i >= 0; i--) {
         var m = list[i]; m.update(dt);
-        if (m.dead) { ctx.scene.remove(m.group); list.splice(i, 1); continue; }
+        if (m.dead) { ctx.scene.remove(m.group); m.dispose(); list.splice(i, 1); continue; }
         m.setLight(ctx.world.brightnessAt(m.pos.x, m.pos.y + 0.5, m.pos.z, dayLight));
       }
       this.spawnTimer -= dt; if (this.spawnTimer <= 0) { this.spawnTimer = 1; this.naturalSpawn(); }
@@ -325,28 +409,41 @@
       var player = ctx.player, world = ctx.world; if (!player) return;
       var c = this.counts(); var night = ctx.sky.isNight();
       var R = MC.rng((Math.random() * 1e9) | 0);
+      var a, d, x, z, y, t;
       if (c.hostile < 14 && ctx.game.difficulty !== 'peaceful') {
-        for (var t = 0; t < 3; t++) {
-          var a = R() * Math.PI * 2, d = 24 + R() * 24; var x = Math.floor(player.pos.x + Math.cos(a) * d), z = Math.floor(player.pos.z + Math.sin(a) * d);
+        for (t = 0; t < 3; t++) {
+          a = R() * Math.PI * 2; d = 24 + R() * 24;
+          x = Math.floor(player.pos.x + Math.cos(a) * d); z = Math.floor(player.pos.z + Math.sin(a) * d);
           if (!world.isLoaded(x, z)) continue;
-          var y;
-          if (R() < 0.5) { y = world.getTopSolid(x, z) + 1; } else { y = 5 + Math.floor(R() * 60); var bb = world.getBlock(x, y - 1, z); if (!(bb > 0 && MC.BLOCKS[bb].solid) || world.getBlock(x, y, z) !== 0 || world.getBlock(x, y + 1, z) !== 0) continue; }
+          if (R() < 0.5) y = world.getTopSolid(x, z) + 1;
+          else { y = 5 + Math.floor(R() * 60); var bb = world.getBlock(x, y - 1, z); if (!(bb > 0 && MC.BLOCKS[bb].solid) || world.getBlock(x, y, z) !== 0 || world.getBlock(x, y + 1, z) !== 0) continue; }
           var below = world.getBlock(x, y - 1, z); if (below <= 0 || !MC.BLOCKS[below].solid || !MC.BLOCKS[below].opaque) continue;
           if (world.getBlock(x, y, z) !== 0 || world.getBlock(x, y + 1, z) !== 0) continue;
-          var l = world.getLight(x, y, z); if (l.block > 0) continue; if (l.sky >= 8 && !night) continue; if (l.sky > 0 && !night && l.sky >= 1) continue;
+          var light = world.getLightPacked(x, y, z);
+          if ((light & 15) > 0) continue;                  // any block light blocks spawning
+          if (!night && (light >> 4) > 0) continue;        // daytime: needs full darkness from the sky
           var type = R() < 0.4 ? 'zombie' : R() < 0.65 ? 'skeleton' : R() < 0.85 ? 'creeper' : 'spider';
-          var pos = new THREE.Vector3(x + 0.5, y, z + 0.5); if (pos.distanceTo(player.pos) < 20) continue;
-          this.spawn(type, pos); break;
+          var dx = x + 0.5 - player.pos.x, dz = z + 0.5 - player.pos.z, dy = y - player.pos.y;
+          if (dx * dx + dy * dy + dz * dz < 400) continue;
+          this.spawn(type, new THREE.Vector3(x + 0.5, y, z + 0.5)); break;
         }
       }
       if (c.passive < 12 && R() < 0.25) {
         for (t = 0; t < 4; t++) {
-          a = R() * Math.PI * 2; d = 20 + R() * 30; x = Math.floor(player.pos.x + Math.cos(a) * d); z = Math.floor(player.pos.z + Math.sin(a) * d);
-          if (!world.isLoaded(x, z)) continue; y = world.getTopSolid(x, z) + 1;
+          a = R() * Math.PI * 2; d = 20 + R() * 30;
+          x = Math.floor(player.pos.x + Math.cos(a) * d); z = Math.floor(player.pos.z + Math.sin(a) * d);
+          if (!world.isLoaded(x, z)) continue;
+          y = world.getTopSolid(x, z) + 1;
           var g = world.getBlock(x, y - 1, z); if (g !== MC.BLOCK.grass_block.id && g !== MC.BLOCK.snowy_grass_block.id) continue;
-          if (world.getBlock(x, y, z) !== 0) continue; if (world.getLight(x, y, z).sky < 9) continue;
-          var ptype = ['pig', 'cow', 'sheep', 'chicken'][R.int(4)]; var n = 2 + R.int(3);
-          for (var k = 0; k < n; k++) { var ox = x + R.int(5) - 2, oz = z + R.int(5) - 2; var oy = world.getTopSolid(ox, oz) + 1; if (Math.abs(oy - y) > 2) continue; var gb = world.getBlock(ox, oy - 1, oz); if (gb !== MC.BLOCK.grass_block.id && gb !== MC.BLOCK.snowy_grass_block.id) continue; this.spawn(ptype, new THREE.Vector3(ox + 0.5, oy, oz + 0.5)); }
+          if (world.getBlock(x, y, z) !== 0) continue;
+          if ((world.getLightPacked(x, y, z) >> 4) < 9) continue;
+          var ptype = PASSIVE_TYPES[R.int(4)]; var n = 2 + R.int(3);
+          for (var k = 0; k < n; k++) {
+            var ox = x + R.int(5) - 2, oz = z + R.int(5) - 2; var oy = world.getTopSolid(ox, oz) + 1;
+            if (Math.abs(oy - y) > 2) continue;
+            var gb = world.getBlock(ox, oy - 1, oz); if (gb !== MC.BLOCK.grass_block.id && gb !== MC.BLOCK.snowy_grass_block.id) continue;
+            this.spawn(ptype, new THREE.Vector3(ox + 0.5, oy, oz + 0.5));
+          }
           break;
         }
       }
@@ -354,7 +451,19 @@
     initialSpawn: function (center, count) {
       var world = ctx.world; var R = MC.rng(this.seedSalt || 7);
       var made = 0, tries = 0;
-      while (made < count && tries < 200) { tries++; var x = Math.floor(center.x + (R() - 0.5) * 80), z = Math.floor(center.z + (R() - 0.5) * 80); if (!world.isLoaded(x, z)) continue; var y = world.getTopSolid(x, z) + 1; var g = world.getBlock(x, y - 1, z); if (g !== MC.BLOCK.grass_block.id && g !== MC.BLOCK.snowy_grass_block.id) continue; var type = ['pig', 'cow', 'sheep', 'chicken'][R.int(4)]; var n = 2 + R.int(3); for (var k = 0; k < n; k++) { var ox = x + R.int(5) - 2, oz = z + R.int(5) - 2; var oy = world.getTopSolid(ox, oz) + 1; var gb = world.getBlock(ox, oy - 1, oz); if (gb !== MC.BLOCK.grass_block.id && gb !== MC.BLOCK.snowy_grass_block.id) continue; this.spawn(type, new THREE.Vector3(ox + 0.5, oy, oz + 0.5)); made++; } }
+      while (made < count && tries < 200) {
+        tries++;
+        var x = Math.floor(center.x + (R() - 0.5) * 80), z = Math.floor(center.z + (R() - 0.5) * 80);
+        if (!world.isLoaded(x, z)) continue;
+        var y = world.getTopSolid(x, z) + 1;
+        var g = world.getBlock(x, y - 1, z); if (g !== MC.BLOCK.grass_block.id && g !== MC.BLOCK.snowy_grass_block.id) continue;
+        var type = PASSIVE_TYPES[R.int(4)]; var n = 2 + R.int(3);
+        for (var k = 0; k < n; k++) {
+          var ox = x + R.int(5) - 2, oz = z + R.int(5) - 2; var oy = world.getTopSolid(ox, oz) + 1;
+          var gb = world.getBlock(ox, oy - 1, oz); if (gb !== MC.BLOCK.grass_block.id && gb !== MC.BLOCK.snowy_grass_block.id) continue;
+          this.spawn(type, new THREE.Vector3(ox + 0.5, oy, oz + 0.5)); made++;
+        }
+      }
     },
     // pick mob along ray within maxDist
     pick: function (origin, dir, maxDist) {
@@ -369,20 +478,45 @@
     anyIntersects: function (x, y, z) { for (var i = 0; i < list.length; i++) if (list[i].intersects(x, y, z)) return true; return false; },
     interact: function (mob, player, held) {
       if (!held) return false;
-      if (mob.type === 'sheep' && held.id === 'shears' && !mob.sheared) { mob.setSheared(true); var n = 1 + Math.floor(Math.random() * 3); ctx.game.spawnDrop({ id: 'white_wool', count: n, damage: 0 }, mob.pos.clone().add(new THREE.Vector3(0, 0.8, 0))); player.damageItem(player.selected, 1); MC.Audio.play('dig.wool', { pos: mob.pos }); return true; }
-      if (mob.type === 'cow' && held.id === 'bucket') { if (!player.isCreative()) { player.inventory.take(player.selected, 1); player.inventory.add('milk_bucket', 1); } MC.Audio.play('cow.ambient', { pos: mob.pos, volume: 0.5 }); return true; }
-      if ((mob.type === 'cow' || mob.type === 'sheep') && held.id === 'wheat' || mob.type === 'pig' && held.id === 'carrot' || mob.type === 'chicken' && held.id === 'wheat_seeds') { for (var i = 0; i < 5; i++) MC.Particles.heart(mob.pos.x + (Math.random() - 0.5), mob.pos.y + mob.height + 0.2, mob.pos.z + (Math.random() - 0.5)); if (!player.isCreative()) player.inventory.take(player.selected, 1); mob.lookAtPlayer = 3; return true; }
+      if (mob.type === 'sheep' && held.id === 'shears' && !mob.sheared) {
+        mob.setSheared(true);
+        ctx.game.spawnDrop({ id: 'white_wool', count: 1 + Math.floor(Math.random() * 3), damage: 0 }, _drop.set(mob.pos.x, mob.pos.y + 0.8, mob.pos.z));
+        player.damageItem(player.selected, 1); MC.Audio.play('dig.wool', { pos: mob.pos });
+        return true;
+      }
+      if (mob.type === 'cow' && held.id === 'bucket') {
+        if (!player.isCreative()) { player.inventory.take(player.selected, 1); player.inventory.add('milk_bucket', 1); }
+        MC.Audio.play('cow.ambient', { pos: mob.pos, volume: 0.5 });
+        return true;
+      }
+      // breeding-style feeding (parenthesised: this relied on && binding tighter than ||)
+      var feeding = ((mob.type === 'cow' || mob.type === 'sheep') && held.id === 'wheat')
+        || (mob.type === 'pig' && held.id === 'carrot')
+        || (mob.type === 'chicken' && held.id === 'wheat_seeds');
+      if (feeding) {
+        for (var i = 0; i < 5; i++) MC.Particles.heart(mob.pos.x + (Math.random() - 0.5), mob.pos.y + mob.height + 0.2, mob.pos.z + (Math.random() - 0.5));
+        if (!player.isCreative()) player.inventory.take(player.selected, 1);
+        mob.lookAtPlayer = 3;
+        return true;
+      }
       return false;
     },
-    clear: function () { for (var i = 0; i < list.length; i++) ctx.scene.remove(list[i].group); list.length = 0; },
+    clear: function () { for (var i = 0; i < list.length; i++) { if (ctx.scene) ctx.scene.remove(list[i].group); list[i].dispose(); } list.length = 0; },
     serialize: function () { return list.filter(function (m) { return !m.dying; }).map(function (m) { return { t: m.type, p: [m.pos.x, m.pos.y, m.pos.z], h: m.health, s: m.sheared }; }); },
     load: function (arr) { if (!arr) return; for (var i = 0; i < arr.length; i++) { var a = arr[i]; var m = this.spawn(a.t, new THREE.Vector3(a.p[0], a.p[1], a.p[2])); if (m) { m.health = a.h; if (a.s) m.setSheared(true); } } }
   };
+  // Unrolled slab test. The array-of-arrays version allocated four arrays per candidate, and
+  // pick() runs it against every mob every frame.
   function rayAABB(o, d, x0, y0, z0, x1, y1, z1) {
-    var tmin = -Infinity, tmax = Infinity;
-    var os = [o.x, o.y, o.z], ds = [d.x, d.y, d.z], a0 = [x0, y0, z0], a1 = [x1, y1, z1];
-    for (var i = 0; i < 3; i++) { if (Math.abs(ds[i]) < 1e-9) { if (os[i] < a0[i] || os[i] > a1[i]) return null; continue; } var t1 = (a0[i] - os[i]) / ds[i], t2 = (a1[i] - os[i]) / ds[i]; if (t1 > t2) { var tmp = t1; t1 = t2; t2 = tmp; } tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2); if (tmin > tmax) return null; }
-    if (tmax < 0) return null; return Math.max(0, tmin);
+    var tmin = -Infinity, tmax = Infinity, t1, t2, tmp;
+    if (d.x > -1e-9 && d.x < 1e-9) { if (o.x < x0 || o.x > x1) return null; }
+    else { t1 = (x0 - o.x) / d.x; t2 = (x1 - o.x) / d.x; if (t1 > t2) { tmp = t1; t1 = t2; t2 = tmp; } if (t1 > tmin) tmin = t1; if (t2 < tmax) tmax = t2; if (tmin > tmax) return null; }
+    if (d.y > -1e-9 && d.y < 1e-9) { if (o.y < y0 || o.y > y1) return null; }
+    else { t1 = (y0 - o.y) / d.y; t2 = (y1 - o.y) / d.y; if (t1 > t2) { tmp = t1; t1 = t2; t2 = tmp; } if (t1 > tmin) tmin = t1; if (t2 < tmax) tmax = t2; if (tmin > tmax) return null; }
+    if (d.z > -1e-9 && d.z < 1e-9) { if (o.z < z0 || o.z > z1) return null; }
+    else { t1 = (z0 - o.z) / d.z; t2 = (z1 - o.z) / d.z; if (t1 > t2) { tmp = t1; t1 = t2; t2 = tmp; } if (t1 > tmin) tmin = t1; if (t2 < tmax) tmax = t2; if (tmin > tmax) return null; }
+    if (tmax < 0) return null;
+    return tmin < 0 ? 0 : tmin;
   }
   MC.Mobs = Mobs; MC.Mob = Mob; MC.MobModel = { build: buildModel, skinFor: skinFor, boxUV: boxUV, makePart: makePart, SHADES: SHADES };
 })();
